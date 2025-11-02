@@ -1,6 +1,21 @@
 host = "127.0.0.1"
-port = 50051
-pool_size = 4
-duckdb_path = null
+port = 4214
+pool_size = 1
+
 ducklake_enable = true
-ducklake_init_sql = null
+ducklake_init_sql = """
+    -- Install required extensions
+    INSTALL ducklake;
+    LOAD ducklake;
+    INSTALL postgres;
+    LOAD postgres;
+
+    -- Attach your own table
+    -- Export the secrets in the environment variables
+    -- S3 or R2: https://duckdb.org/docs/stable/core_extensions/httpfs/s3api
+    -- Postgres: https://duckdb.org/docs/stable/core_extensions/postgres#configuration
+    -- ATTACH 'ducklake:postgres:dbname=ducklake-test' AS swandb (DATA_PATH 'r2://ducklake-test/');
+
+    -- Start the UI server at http://localhost:4213/
+    call start_ui_server();
+"""

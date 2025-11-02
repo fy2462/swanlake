@@ -1,15 +1,31 @@
 [package]
 name = "swandb"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[[bin]]
+name = "swandb"
+path = "src/bin/swandb.rs"
+
+[[bin]]
+name = "run_sqllogictest"
+path = "src/bin/run_sqllogictest.rs"
+required-features = ["test-runner"]
+
+[features]
+default = []
+test-runner = ["dep:arrow-cast", "dep:async-trait", "dep:sqllogictest"]
 
 [dependencies]
 anyhow = "1.0"
-arrow-array = "56.2.0"
-arrow-flight = { version = "56.2.0", features = ["flight-sql"] }
-arrow-schema = "56.2.0"
+arrow-array = "56"
+arrow-flight = { version = "56", features = ["flight-sql"] }
+arrow-ipc = "56"
+arrow-schema = "56"
+arrow-cast = { version = "56", optional = true }
+async-trait = { version = "0.1", optional = true }
 dotenvy = "0.15"
-duckdb = { version = "1.4.1", features = ["bundled", "r2d2"] }
+duckdb = { version = "1.4.1", default-features = false, features = ["r2d2"] }
 futures = "0.3"
 prost = "0.13.5"
 r2d2 = "0.8"
@@ -20,3 +36,4 @@ tonic = { version = "0.13.1", features = ["transport"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 toml = "0.8"
+sqllogictest = { version = "0.28.4", optional = true }

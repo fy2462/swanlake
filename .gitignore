@@ -1,1 +1,6 @@
 /target
+.duckdb/
+.env
+.env.*
+/ducklake_files/
+/ducklake_meta/

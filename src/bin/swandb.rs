@@ -1,19 +1,14 @@
-mod config;
-mod duckdb;
-mod error;
-mod service;
-
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
-use config::ServerConfig;
-use duckdb::DuckDbEngine;
-use service::SwanFlightSqlService;
+use anyhow::{bail, Context, Result};
+use swandb::config::ServerConfig;
+use swandb::duckdb::DuckDbEngine;
+use swandb::service::SwanFlightSqlService;
 use tonic::transport::Server;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,10 +35,16 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,swandb::service=debug,swandb::duckdb=debug"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(false)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
         .compact()
         .init();
 }

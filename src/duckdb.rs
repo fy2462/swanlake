@@ -4,7 +4,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use duckdb::{Config, DuckdbConnectionManager};
 use r2d2::Pool;
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
 use crate::config::ServerConfig;
 use crate::error::ServerError;
@@ -47,6 +47,7 @@ impl DuckDbEngine {
         Ok(engine)
     }
 
+    #[instrument(skip(self, config))]
     fn initialize_ducklake(&self, config: &ServerConfig) -> Result<(), ServerError> {
         if !config.ducklake_enable {
             info!("DuckLake extension disabled via configuration");
@@ -54,13 +55,10 @@ impl DuckDbEngine {
         }
 
         let conn = self.inner.pool.get()?;
-        info!("Ensuring ducklake extension is installed and loaded");
-        conn.execute_batch("INSTALL ducklake; LOAD ducklake;")?;
-
         if let Some(sql) = config.ducklake_init_sql.as_ref() {
             let trimmed = sql.trim();
             if !trimmed.is_empty() {
-                info!("Running ducklake init SQL");
+                info!("Running ducklake init SQL:\n{}", trimmed);
                 conn.execute_batch(trimmed)?;
             }
         }
@@ -68,17 +66,18 @@ impl DuckDbEngine {
         Ok(())
     }
 
-    #[instrument(skip_all, fields(sql = %sql))]
+    #[instrument(skip(self), fields(sql = %sql))]
     pub fn schema_for_query(&self, sql: &str) -> Result<Schema, ServerError> {
         let conn = self.inner.pool.get()?;
         let mut stmt = conn.prepare(sql)?;
         let arrow = stmt.query_arrow([])?;
         let schema = arrow.get_schema();
 
+        debug!(field_count = schema.fields().len(), "retrieved schema");
         Ok(schema.as_ref().clone())
     }
 
-    #[instrument(skip_all, fields(sql = %sql))]
+    #[instrument(skip(self), fields(sql = %sql))]
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult, ServerError> {
         let conn = self.inner.pool.get()?;
         let mut stmt = conn.prepare(sql)?;
@@ -95,11 +94,32 @@ impl DuckDbEngine {
             })
             .collect();
 
+        debug!(
+            batch_count = batches.len(),
+            total_rows, total_bytes, "executed query"
+        );
         Ok(QueryResult {
             schema: schema.as_ref().clone(),
             batches,
             total_rows,
             total_bytes,
         })
+    }
+
+    #[instrument(skip(self), fields(sql = %sql))]
+    pub fn execute_statement(&self, sql: &str) -> Result<i64, ServerError> {
+        let conn = self.inner.pool.get()?;
+        conn.execute_batch(sql)?;
+        // For DDL statements like ATTACH, CREATE, DROP, etc., we return 0 affected rows
+        // DuckDB's execute_batch doesn't provide affected row count
+        debug!("executed statement");
+        Ok(0)
+    }
+
+    #[instrument(skip(self))]
+    pub(crate) fn get_connection(
+        &self,
+    ) -> Result<r2d2::PooledConnection<DuckdbConnectionManager>, ServerError> {
+        Ok(self.inner.pool.get()?)
     }
 }

@@ -48,11 +48,62 @@ The server listens on `127.0.0.1:50051` by default and can be configured through
 
 `.env` files are loaded automatically via `dotenvy`. You can also point the binary at a custom `config.toml` with `--config`; environment variables always take precedence.
 
+### DuckDB native library
+
+We link against the official DuckDB binary instead of compiling C++ sources on every build. Run the helper script once to download the correct archive for your platform and create an env file with the necessary exports:
+
+```bash
+# grabs v1.4.1 into .duckdb/ and generates .duckdb/env.sh
+scripts/setup_duckdb.sh
+
+# enable the environment in your shell
+source .duckdb/env.sh
+
+# now build or run as usual
+cargo check
+```
+
+The script stores the archive inside `.duckdb/<version>` (ignored by git) and keeps `DUCKDB_LIB_DIR`, `DUCKDB_INCLUDE_DIR`, and the appropriate loader path in `.duckdb/env.sh`. CI and other tooling can simply `source` the same file before invoking Cargo.
+
 ## Architecture overview
 
 - `config`: loads runtime configuration from the environment.
 - `duckdb`: thin query engine that fans out synchronous DuckDB work into blocking tasks, manages an r2d2-backed DuckDB pool, installs/loads the DuckLake extension, and exposes results as Arrow batches.
-- `service`: minimal [`FlightSqlService`](https://docs.rs/arrow-flight/latest/arrow_flight/sql/server/trait.FlightSqlService.html) implementation that handles `CommandStatementQuery` and streams results via Arrow Flight.
+- `service`: minimal [`FlightSqlService`](https://docs.rs/arrow-flight/latest/arrow_flight/sql/server/trait.FlightSqlService.html) implementation that handles `CommandStatementQuery` (SELECT queries) and `CommandStatementUpdate` (DDL/DML statements) and streams results via Arrow Flight.
 - `main`: wires configuration, logging, and the Flight SQL gRPC server together.
 
 The implementation keeps the DuckDB engine simple on purpose—queries are executed directly and the resulting `RecordBatch`es are converted to Flight `FlightData`. DuckLake is handled as a DuckDB extension: we install/load it at startup (unless disabled) and optionally run custom SQL afterwards so we fail fast if attachment fails. Connection management is delegated to an r2d2 pool so concurrent RPCs get cheap cloned handles.
+
+### Flight SQL Operations
+
+The server supports the standard Flight SQL prepared statement flow with automatic query vs. statement detection:
+
+#### Recommended Flow: Prepared Statements with Auto-Detection
+
+1. **Client calls:** `DoAction("CreatePreparedStatement")` with SQL
+   - Server analyzes SQL using DuckDB's column count detection
+   - Returns `ActionCreatePreparedStatementResult` with:
+     - `dataset_schema` - **non-empty for queries (SELECT), empty for statements (DDL/DML)**
+     - `prepared_statement_handle` - opaque handle (currently the SQL itself)
+
+2. **Client inspects `dataset_schema` and routes accordingly:**
+   - If non-empty schema → Query path: `GetFlightInfo` + `DoGet`
+   - If empty schema → Update path: `DoPut`
+
+#### Direct Execution (Alternative)
+
+You can also execute SQL directly without the prepared statement flow:
+
+1. **Queries (SELECT)** - Use `CommandStatementQuery` via `get_flight_info_statement` + `do_get_statement`
+   - Returns result sets as Arrow batches
+   - Example: `SELECT * FROM table`
+
+2. **Statements (DDL/DML)** - Use `CommandStatementUpdate` via `do_put_statement_update`
+   - Executes statements that don't return results (ATTACH, CREATE, DROP, INSERT, UPDATE, DELETE)
+   - Returns affected row count (0 for DDL statements)
+   - Example: `ATTACH 'ducklake:postgres:dbname=test' AS ducklake (DATA_PATH 'r2://bucket/')`
+
+**Detection Method:** The server uses keyword-based analysis to avoid executing statements prematurely:
+- Keywords like `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `EXPLAIN`, `VALUES`, `TABLE`, `PRAGMA` → Query
+- All other keywords (`ATTACH`, `CREATE`, `DROP`, `INSERT`, `UPDATE`, `DELETE`, etc.) → Statement
+- Handles SQL comments (`--` and `/* */`) correctly
