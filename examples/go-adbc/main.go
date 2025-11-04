@@ -95,7 +95,7 @@ func main() {
 	// Autocommit assumed default
 
 	// Select all people
-	people, err := selectPeople(ctx, conn, "SELECT * FROM swandb.person ORDER BY first_name ASC")
+	people, err := selectPeople(ctx, conn, "SELECT * FROM person ORDER BY first_name ASC")
 	if err != nil {
 		log.Fatalf("Failed to query people: %v", err)
 	}
