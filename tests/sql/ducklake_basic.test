@@ -7,7 +7,7 @@ require ducklake
 require parquet
 
 statement ok
-ATTACH 'ducklake:postgres:dbname=ducklake-test' AS ducklake (DATA_PATH 'r2://ducklake-test/')
+ATTACH 'ducklake:__TEST_DIR__/ducklake.db' AS ducklake (DATA_PATH '__TEST_DIR__/ducklake_files', METADATA_CATALOG 'ducklake_meta')
 
 statement ok
 CREATE TABLE ducklake.test(i INTEGER, j INTEGER);
@@ -54,7 +54,7 @@ statement ok
 DETACH ducklake
 
 statement ok
-ATTACH 'ducklake:postgres:dbname=ducklake-test' AS ducklake (DATA_PATH 'r2://ducklake-test/')
+ATTACH 'ducklake:__TEST_DIR__/ducklake.db' AS ducklake
 
 query II
 SELECT * FROM ducklake.test
@@ -80,3 +80,13 @@ SHOW TABLES
 ----
 test
 test2
+
+# data path is not required for DuckDB databases
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/ducklake_no_data_path.db' AS ducklake_no_data_path
+
+statement ok
+CREATE TABLE ducklake_no_data_path.tbl(i INT);
+
+statement ok
+INSERT INTO ducklake_no_data_path.tbl VALUES (42);

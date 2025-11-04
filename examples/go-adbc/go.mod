@@ -1,4 +1,4 @@
-module github.com/wangfenjin/swandb/go-client
+module github.com/wangfenjin/swandb/examples/go-adbc
 
 go 1.21
 

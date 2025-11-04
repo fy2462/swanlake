@@ -6,5 +6,5 @@
 /ducklake_meta/
 
 # Go
-go-client/bin/
-go-client/go.sum
+examples/go-adbc/go-adbc
+tests/runner-go/runner-go

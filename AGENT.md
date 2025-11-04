@@ -208,20 +208,20 @@ cargo run -- --config path/to/custom.toml
 
 ```bash
 # Full integration test (builds server + runs Go client tests)
-./test-integration.sh
+./scripts/test-integration.sh
 
 # Manual testing:
 # Terminal 1:
 SWANDB_PORT=50051 cargo run
 
 # Terminal 2:
-cd go-client
+cd examples/go
 SWANDB_PORT=50051 go run main.go
 ```
 
 ## Testing Framework
 
-### Go Client (go-client/)
+### Go Client (examples/go/)
 
 ADBC-based testing framework with 6 test scenarios:
 
@@ -236,13 +236,13 @@ ADBC-based testing framework with 6 test scenarios:
 
 ```bash
 # Run all tests
-./test-integration.sh
+./scripts/test-integration.sh
 
 # Go client only
-cd go-client && ./test.sh
+cd examples/go && ./test.sh
 
 # Benchmarks
-cd go-client && go test -bench=. -benchmem
+cd examples/go && go test -bench=. -benchmem
 ```
 
 ## Current Limitations
@@ -252,7 +252,7 @@ cd go-client && go test -bench=. -benchmem
 3. **No transactions** - Each query runs in its own transaction
 4. **Limited metadata** - No `get_catalogs`, `get_db_schemas`, `get_tables` yet
 
-See `go-client/ROADMAP.md` for implementation priorities.
+See `examples/go/ROADMAP.md` for implementation priorities.
 
 ## Key Files to Know
 
@@ -271,8 +271,8 @@ See `go-client/ROADMAP.md` for implementation priorities.
 
 ### Testing
 - `test-integration.sh` - Automated integration test runner
-- `go-client/main.go` - ADBC-based test suite
-- `go-client/test.sh` - Go client test runner
+- `examples/go/main.go` - ADBC-based test suite
+- `examples/go/test.sh` - Go client test runner
 
 ### Configuration
 - `config.toml` - Configuration file
@@ -285,8 +285,8 @@ See `go-client/ROADMAP.md` for implementation priorities.
 
 1. Add method to `SwanFlightSqlService` in `src/service.rs`
 2. Implement DuckDB logic in `src/duckdb.rs` if needed
-3. Add test case to `go-client/main.go`
-4. Run `./test-integration.sh` to verify
+3. Add test case to `examples/go/main.go`
+4. Run `./scripts/test-integration.sh` to verify
 
 ### Debug Performance Issues
 
@@ -350,7 +350,7 @@ RUST_LOG=debug cargo run 2>&1 | grep "LIMIT 0"
 ### Test Prepared Statements
 
 ```bash
-cd go-client
+cd examples/go
 RUST_LOG=debug SWANDB_PORT=50051 go run main.go
 # Check Test 5 output for prepared statement flow
 ```
@@ -365,4 +365,4 @@ SwanDB is a production-ready Arrow Flight SQL server with well-documented perfor
 - Performance: See `OPTIMIZATIONS.md`
 - Prepared Statements: See `PREPARED_STATEMENT_DECISION.md` and `PREPARED_STATEMENT_OPTIONS.md`
 - Implementation History: See `IMPLEMENTATION_SUMMARY.md` and `OPTIMIZATION_SUMMARY.md`
-- Getting Started: See `README.md` and `go-client/QUICKSTART.md`
+- Getting Started: See `README.md` and `examples/go/QUICKSTART.md`

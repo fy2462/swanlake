@@ -56,18 +56,18 @@ The server listens on `127.0.0.1:4214` by default and can be configured through 
 
 ### Testing with the Go Client
 
-A Go client using Apache Arrow ADBC is available in the `go-client/` directory for testing the Flight SQL server:
+A Go client using Apache Arrow ADBC is available in the `examples/go/` directory for testing the Flight SQL server:
 
 ```bash
 # Run automated integration test (builds server + runs tests)
-./test-integration.sh
+./scripts/test-integration.sh
 
 # Or manually:
 # Terminal 1: Start the server
 SWANDB_PORT=50051 cargo run
 
 # Terminal 2: Run the Go client tests
-cd go-client
+cd examples/go
 SWANDB_PORT=50051 ./test.sh
 ```
 
@@ -78,7 +78,7 @@ The Go client tests:
 - Prepared statement flow (CREATE → PREPARE → EXECUTE)
 - Query result reading with Arrow types
 
-See [go-client/README.md](go-client/README.md) for detailed usage and examples.
+See [examples/go/README.md](examples/go/README.md) for detailed usage and examples.
 
 ### DuckDB native library
 

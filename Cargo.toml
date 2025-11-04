@@ -5,12 +5,7 @@ edition = "2021"
 
 [[bin]]
 name = "swandb"
-path = "src/bin/swandb.rs"
-
-[[bin]]
-name = "run_sqllogictest"
-path = "src/bin/run_sqllogictest.rs"
-required-features = ["test-runner"]
+path = "src/main.rs"
 
 [features]
 default = []

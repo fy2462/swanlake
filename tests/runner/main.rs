@@ -154,8 +154,8 @@ struct CliArgs {
     vars: HashMap<String, String>,
 }
 
-fn parse_args() -> Result<CliArgs> {
-    let mut args = std::env::args().skip(1);
+fn parse_args<I: IntoIterator<Item = String>>(args_iter: I) -> Result<CliArgs> {
+    let mut args = args_iter.into_iter();
     let mut endpoint = String::from("http://127.0.0.1:4214");
     let mut labels = Vec::new();
     let mut vars = HashMap::new();
@@ -178,8 +178,7 @@ fn parse_args() -> Result<CliArgs> {
                 vars.insert(format!("__{key}__"), value.to_string());
             }
             "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
+                bail!("help requested");
             }
             other if other.starts_with('-') => {
                 bail!("unknown argument: {other}");
@@ -198,12 +197,6 @@ fn parse_args() -> Result<CliArgs> {
         labels,
         vars,
     })
-}
-
-fn print_usage() {
-    eprintln!(
-        "Usage: run_sqllogictest [--endpoint <url>] [--label <name>] [--var KEY=VALUE] <test-file>..."
-    );
 }
 
 fn resolve_test_dir(path: &Path) -> Result<String> {
@@ -284,9 +277,9 @@ fn column_type_from_arrow(data_type: &DataType) -> DefaultColumnType {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = parse_args()?;
+#[tokio::test]
+async fn run_sqllogictest() -> Result<()> {
+    let args = parse_args(vec!["tests/sql/ducklake_basic.test".to_string()])?;
 
     for test_file in &args.test_files {
         let test_dir = resolve_test_dir(test_file)?;

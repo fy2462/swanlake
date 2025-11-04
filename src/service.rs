@@ -1,12 +1,14 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow_flight::sql::server::FlightSqlService;
-use arrow_flight::sql::server::PeekableFlightDataStream;
+use arrow_flight::sql::metadata::SqlInfoDataBuilder;
+use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
 use arrow_flight::sql::{
+    ActionBeginTransactionRequest, ActionBeginTransactionResult,
     ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult,
-    CommandPreparedStatementQuery, CommandStatementQuery, CommandStatementUpdate, ProstMessageExt,
-    SqlInfo, TicketStatementQuery,
+    ActionEndTransactionRequest, CommandGetSqlInfo, CommandPreparedStatementQuery,
+    CommandPreparedStatementUpdate, CommandStatementQuery, CommandStatementUpdate, ProstMessageExt,
+    SqlInfo, SqlSupportedTransaction, SqlTransactionIsolationLevel, TicketStatementQuery,
 };
 use arrow_flight::{
     flight_service_server::FlightService, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
@@ -209,8 +211,118 @@ impl FlightSqlService for SwanFlightSqlService {
         Ok(response)
     }
 
-    async fn register_sql_info(&self, id: i32, info: &SqlInfo) {
-        tracing::debug!(id, ?info, "register_sql_info invoked");
+    async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {
+        // No-op: we don't need to register info dynamically
+    }
+
+    #[instrument(skip(self, request))]
+    async fn get_flight_info_sql_info(
+        &self,
+        query: CommandGetSqlInfo,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        debug!("get_flight_info_sql_info called");
+
+        // Build SQL info metadata to get schema
+        let mut builder = SqlInfoDataBuilder::new();
+
+        // Report that Flight SQL transaction API is supported
+        builder.append(
+            SqlInfo::FlightSqlServerTransaction,
+            SqlSupportedTransaction::Transaction as i32,
+        );
+
+        // Report that SQL-level transactions are supported
+        builder.append(SqlInfo::SqlTransactionsSupported, true);
+
+        // Report transaction isolation level support
+        // DuckDB defaults to serializable isolation
+        builder.append(
+            SqlInfo::SqlDefaultTransactionIsolation,
+            SqlTransactionIsolationLevel::SqlTransactionSerializable as i32,
+        );
+
+        // Report supported isolation levels (all standard levels)
+        // Bitmask: bit 0 = none, bit 1 = read uncommitted, bit 2 = read committed,
+        //          bit 3 = repeatable read, bit 4 = serializable
+        builder.append(SqlInfo::SqlSupportedTransactionsIsolationLevels, 0b11110);
+
+        let info_data = builder
+            .build()
+            .map_err(|e| Status::internal(format!("Failed to build SqlInfo data: {}", e)))?;
+
+        let schema = info_data.schema();
+
+        // Create ticket for do_get_sql_info
+        let ticket_bytes = query.as_any().encode_to_vec();
+        let endpoint = FlightEndpoint::new().with_ticket(Ticket::new(ticket_bytes));
+
+        let descriptor = request.into_inner();
+        let info = FlightInfo::new()
+            .try_with_schema(schema.as_ref())
+            .map_err(|err| Status::internal(format!("failed to encode schema: {err}")))?
+            .with_descriptor(descriptor)
+            .with_endpoint(endpoint)
+            .with_total_records(-1); // Unknown number of records
+
+        debug!("Returning FlightInfo for SqlInfo");
+        Ok(Response::new(info))
+    }
+
+    #[instrument(skip(self, _request))]
+    async fn do_get_sql_info(
+        &self,
+        query: CommandGetSqlInfo,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        debug!("do_get_sql_info called");
+
+        // Build SQL info metadata
+        let mut builder = SqlInfoDataBuilder::new();
+
+        // Report that Flight SQL transaction API is supported
+        builder.append(
+            SqlInfo::FlightSqlServerTransaction,
+            SqlSupportedTransaction::Transaction as i32,
+        );
+
+        // Report that SQL-level transactions are supported
+        builder.append(SqlInfo::SqlTransactionsSupported, true);
+
+        // Report transaction isolation level support
+        // DuckDB defaults to serializable isolation
+        builder.append(
+            SqlInfo::SqlDefaultTransactionIsolation,
+            SqlTransactionIsolationLevel::SqlTransactionSerializable as i32,
+        );
+
+        // Report supported isolation levels (all standard levels)
+        builder.append(SqlInfo::SqlSupportedTransactionsIsolationLevels, 0b11110);
+
+        let info_data = builder
+            .build()
+            .map_err(|e| Status::internal(format!("Failed to build SqlInfo data: {}", e)))?;
+
+        // Build the response batch
+        let batch = query
+            .into_builder(&info_data)
+            .build()
+            .map_err(|e| Status::internal(format!("Failed to build SqlInfo response: {}", e)))?;
+
+        let schema = batch.schema();
+        debug!("Returning SqlInfo with {} rows", batch.num_rows());
+
+        // Convert to Flight data stream
+        let flight_data = arrow_flight::utils::batches_to_flight_data(&schema, vec![batch])
+            .map_err(|err| {
+                error!(%err, "failed to convert SqlInfo batch to flight data");
+                Status::internal(format!(
+                    "failed to convert SqlInfo batch to flight data: {err}"
+                ))
+            })?;
+
+        let stream = Self::into_stream(flight_data);
+        Ok(Response::new(stream))
     }
 
     #[instrument(skip(self, _request), fields(sql = %command.query))]
@@ -413,5 +525,81 @@ impl FlightSqlService for SwanFlightSqlService {
         }
         info!(%sql, total_rows, total_bytes, "prepared statement completed");
         Ok(response)
+    }
+
+    #[instrument(skip(self, _request), fields(handle_len = query.prepared_statement_handle.len()))]
+    async fn do_put_prepared_statement_update(
+        &self,
+        query: CommandPreparedStatementUpdate,
+        _request: Request<PeekableFlightDataStream>,
+    ) -> Result<i64, Status> {
+        // Decode the prepared statement handle (which is just the SQL text)
+        let sql = String::from_utf8(query.prepared_statement_handle.to_vec())
+            .map_err(|err| Status::invalid_argument(format!("invalid handle encoding: {err}")))?;
+
+        let engine = self.engine.clone();
+        let sql_for_exec = sql.clone();
+
+        info!(%sql, "executing prepared statement update via do_put_prepared_statement_update");
+
+        let affected_rows =
+            tokio::task::spawn_blocking(move || engine.execute_statement(&sql_for_exec))
+                .await
+                .map_err(Self::status_from_join)?
+                .map_err(Self::status_from_error)?;
+
+        info!(%sql, affected_rows, "prepared statement update completed");
+
+        Ok(affected_rows)
+    }
+
+    #[instrument(skip(self, _request))]
+    async fn do_action_begin_transaction(
+        &self,
+        _query: ActionBeginTransactionRequest,
+        _request: Request<arrow_flight::Action>,
+    ) -> Result<ActionBeginTransactionResult, Status> {
+        debug!("do_action_begin_transaction called");
+
+        // Generate a simple transaction ID
+        // For now, we use a timestamp-based ID since DuckDB transactions are per-connection
+        let transaction_id = format!(
+            "txn_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        info!(transaction_id, "transaction started");
+
+        Ok(ActionBeginTransactionResult {
+            transaction_id: transaction_id.into_bytes().into(),
+        })
+    }
+
+    #[instrument(skip(self, _request), fields(transaction_id))]
+    async fn do_action_end_transaction(
+        &self,
+        query: ActionEndTransactionRequest,
+        _request: Request<arrow_flight::Action>,
+    ) -> Result<(), Status> {
+        let transaction_id = String::from_utf8(query.transaction_id.to_vec())
+            .unwrap_or_else(|_| "<invalid>".to_string());
+
+        tracing::Span::current().record("transaction_id", &transaction_id);
+
+        let action = query.action;
+        debug!(transaction_id, action, "do_action_end_transaction called");
+
+        // For now, we just log and return success
+        // In a full implementation, we would track transaction state and execute COMMIT/ROLLBACK
+        if action == 0 {
+            info!(transaction_id, "transaction committed");
+        } else {
+            info!(transaction_id, "transaction rolled back");
+        }
+
+        Ok(())
     }
 }

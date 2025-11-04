@@ -2,13 +2,18 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::config::ServerConfig;
+use crate::duckdb::DuckDbEngine;
+use crate::service::SwanFlightSqlService;
 use anyhow::{bail, Context, Result};
-use swandb::config::ServerConfig;
-use swandb::duckdb::DuckDbEngine;
-use swandb::service::SwanFlightSqlService;
 use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
+
+mod config;
+mod duckdb;
+mod error;
+mod service;
 
 #[tokio::main]
 async fn main() -> Result<()> {
