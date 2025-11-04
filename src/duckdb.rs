@@ -20,6 +20,7 @@ struct EngineInner {
     write_pool: Pool<DuckdbConnectionManager>,
     writes_enabled: bool,
     session_inits: Mutex<Vec<String>>,
+    ui_server_started: Mutex<bool>,
 }
 
 pub struct QueryResult {
@@ -59,6 +60,7 @@ impl DuckDbEngine {
                 write_pool,
                 writes_enabled: config.enable_writes,
                 session_inits: Mutex::new(Vec::new()),
+                ui_server_started: Mutex::new(false),
             }),
         };
 
@@ -75,6 +77,28 @@ impl DuckDbEngine {
 
         let conn = self.inner.write_pool.get()?;
         self.apply_session_inits(&conn)?;
+
+        // Always install and load extensions
+        let extension_sql = "INSTALL ducklake; INSTALL httpfs; INSTALL aws; INSTALL postgres; LOAD ducklake; LOAD httpfs; LOAD aws; LOAD postgres;";
+        info!("Installing and loading default extensions {extension_sql}");
+        conn.execute_batch(extension_sql)?;
+        self.register_session_init(extension_sql);
+
+        // Auto start UI server once if enabled
+        if config.enable_ui_server {
+            let mut started = self
+                .inner
+                .ui_server_started
+                .lock()
+                .expect("ui_server_started mutex poisoned");
+            if !*started {
+                info!("Starting UI server http://localhost:4213");
+                conn.execute_batch("CALL start_ui_server();")?;
+                *started = true;
+            }
+        }
+
+        // Execute user-provided ducklake_init_sql (e.g., attach statements)
         if let Some(sql) = config.ducklake_init_sql.as_ref() {
             let trimmed = sql.trim();
             if !trimmed.is_empty() {
@@ -302,11 +326,11 @@ impl DuckDbEngine {
                     return None;
                 }
                 let upper = trimmed.to_ascii_uppercase();
-                if upper.starts_with("ATTACH ")
+                if upper.starts_with("INSTALL ")
+                    || upper.starts_with("LOAD ")
+                    || upper.starts_with("ATTACH ")
                     || upper.starts_with("DETACH ")
                     || upper.starts_with("USE ")
-                    || upper.starts_with("SET SCHEMA")
-                    || upper.starts_with("SET SEARCH_PATH")
                 {
                     Some(trimmed.to_string())
                 } else {

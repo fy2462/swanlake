@@ -838,7 +838,6 @@ impl FlightSqlService for SwanFlightSqlService {
         info!(%sql, "executing statement via do_put_statement_update");
 
         let sql_for_exec = sql.clone();
-        self.engine.register_session_init(&sql);
         let affected_rows = if let Some(txn_id) = transaction_id {
             let conn = self
                 .transactions
@@ -1141,7 +1140,6 @@ impl FlightSqlService for SwanFlightSqlService {
             "executing prepared statement update via do_put_prepared_statement_update"
         );
 
-        self.engine.register_session_init(&meta.sql);
         let affected_rows = if let Some(txn_id) = meta.transaction_id.clone() {
             let conn_arc = self
                 .transactions

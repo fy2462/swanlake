@@ -1,10 +1,10 @@
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::Path;
 
 use anyhow::Context;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -20,26 +20,40 @@ pub struct ServerConfig {
     pub ducklake_enable: bool,
     /// Optional SQL statement executed during startup for ducklake integration.
     pub ducklake_init_sql: Option<String>,
+    /// Whether to start the UI server automatically.
+    pub enable_ui_server: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 4214,
+            pool_size: 10,
+            read_pool_size: Some(10),
+            write_pool_size: Some(3),
+            enable_writes: true,
+            ducklake_enable: true,
+            ducklake_init_sql: None,
+            enable_ui_server: true,
+        }
+    }
 }
 
 impl ServerConfig {
-    pub fn load(config_path: &Path) -> anyhow::Result<Self> {
+    pub fn load() -> anyhow::Result<Self> {
+        let defaults_json = serde_json::to_string(&Self::default())
+            .with_context(|| "failed to serialize defaults")?;
         let settings = config::Config::builder()
-            .add_source(config::File::with_name(config_path.to_str().unwrap()).required(true))
-            .add_source(config::Environment::with_prefix("SWANDB_").separator("_"))
-            .build()
-            .with_context(|| {
-                format!(
-                    "failed to load configuration from {}",
-                    config_path.display()
-                )
-            })?;
-        let cfg: ServerConfig = settings.try_deserialize().with_context(|| {
-            format!(
-                "failed to deserialize configuration from {}",
-                config_path.display()
+            .add_source(
+                config::File::from_str(&defaults_json, config::FileFormat::Json).required(false),
             )
-        })?;
+            .add_source(config::Environment::with_prefix("SWANDB"))
+            .build()
+            .with_context(|| "failed to load configuration")?;
+        let cfg: ServerConfig = settings
+            .try_deserialize()
+            .with_context(|| "failed to deserialize configuration")?;
         Ok(cfg)
     }
 

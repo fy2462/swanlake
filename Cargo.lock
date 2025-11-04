@@ -2269,6 +2269,7 @@ dependencies = [
  "prost",
  "r2d2",
  "serde",
+ "serde_json",
  "sqllogictest",
  "thiserror 1.0.69",
  "tokio",

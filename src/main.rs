@@ -1,11 +1,9 @@
-use std::env;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::ServerConfig;
 use crate::duckdb::DuckDbEngine;
 use crate::service::SwanFlightSqlService;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
@@ -20,8 +18,8 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     init_tracing();
 
-    let config_path = parse_args()?;
-    let config = ServerConfig::load(&config_path).context("failed to load configuration")?;
+    let config = ServerConfig::load().context("failed to load configuration")?;
+    info!("service config:\n{:?}", config);
     let addr = config
         .bind_addr()
         .context("failed to resolve bind address")?;
@@ -51,25 +49,4 @@ fn init_tracing() {
         .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
         .compact()
         .init();
-}
-
-fn parse_args() -> Result<PathBuf> {
-    let mut args = env::args().skip(1);
-    let mut config_path = PathBuf::from("config.toml");
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--config" | "-c" => {
-                let path = args.next().context("--config requires a path argument")?;
-                config_path = PathBuf::from(path);
-            }
-            "--help" | "-h" => {
-                println!("Usage: swandb [--config <path>]");
-                std::process::exit(0);
-            }
-            other => bail!("unknown argument: {other}"),
-        }
-    }
-
-    Ok(config_path)
 }
