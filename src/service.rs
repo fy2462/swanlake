@@ -1,7 +1,5 @@
-use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
@@ -25,137 +23,62 @@ use arrow_flight::{
     Ticket,
 };
 use arrow_schema::{DataType, Schema};
-use duckdb::{types::Value, Connection, DuckdbConnectionManager};
+use duckdb::types::Value;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use prost::Message;
-use r2d2::PooledConnection;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument};
 
 use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 
-use crate::duckdb::{DuckDbEngine, QueryResult};
+use crate::engine::connection::QueryResult;
 use crate::error::ServerError;
-use tokio::sync::Mutex;
+use crate::session::{
+    registry::SessionRegistry,
+    session::{PreparedStatementMeta, Session},
+    SessionId,
+};
+use uuid::Uuid;
 
-#[derive(Clone)]
-struct PreparedStatementMeta {
-    sql: String,
-    is_query: bool,
-    transaction_id: Option<String>,
-}
-
-struct PreparedStatementState {
-    meta: PreparedStatementMeta,
-    pending_parameters: Option<Vec<Vec<Value>>>,
-}
-
-impl PreparedStatementState {
-    fn new(meta: PreparedStatementMeta) -> Self {
-        Self {
-            meta,
-            pending_parameters: None,
-        }
-    }
-}
-
-#[derive(Default)]
-struct PreparedStatementStore {
-    inner: Mutex<HashMap<String, PreparedStatementState>>,
-}
-
-impl PreparedStatementStore {
-    async fn insert(&self, handle: String, meta: PreparedStatementMeta) {
-        let mut guard = self.inner.lock().await;
-        guard.insert(handle, PreparedStatementState::new(meta));
-    }
-
-    async fn meta(&self, handle: &str) -> Result<PreparedStatementMeta, ServerError> {
-        let guard = self.inner.lock().await;
-        guard
-            .get(handle)
-            .map(|state| state.meta.clone())
-            .ok_or_else(|| ServerError::PreparedStatementNotFound(handle.to_string()))
-    }
-
-    async fn set_parameters(
-        &self,
-        handle: &str,
-        params: Option<Vec<Vec<Value>>>,
-    ) -> Result<(), ServerError> {
-        let mut guard = self.inner.lock().await;
-        let state = guard
-            .get_mut(handle)
-            .ok_or_else(|| ServerError::PreparedStatementNotFound(handle.to_string()))?;
-        state.pending_parameters = params;
-        Ok(())
-    }
-
-    async fn take_parameters(&self, handle: &str) -> Result<Option<Vec<Vec<Value>>>, ServerError> {
-        let mut guard = self.inner.lock().await;
-        let state = guard
-            .get_mut(handle)
-            .ok_or_else(|| ServerError::PreparedStatementNotFound(handle.to_string()))?;
-        Ok(state.pending_parameters.take())
-    }
-
-    async fn remove(&self, handle: &str) -> Result<(), ServerError> {
-        let mut guard = self.inner.lock().await;
-        guard
-            .remove(handle)
-            .ok_or_else(|| ServerError::PreparedStatementNotFound(handle.to_string()))?;
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct TransactionManager {
-    inner: Mutex<HashMap<String, Arc<StdMutex<PooledConnection<DuckdbConnectionManager>>>>>,
-}
-
-impl TransactionManager {
-    async fn insert(&self, id: String, conn: PooledConnection<DuckdbConnectionManager>) {
-        let mut guard = self.inner.lock().await;
-        guard.insert(id, Arc::new(StdMutex::new(conn)));
-    }
-
-    async fn get(
-        &self,
-        id: &str,
-    ) -> Result<Arc<StdMutex<PooledConnection<DuckdbConnectionManager>>>, ServerError> {
-        let guard = self.inner.lock().await;
-        guard
-            .get(id)
-            .cloned()
-            .ok_or_else(|| ServerError::TransactionNotFound(id.to_string()))
-    }
-
-    async fn remove(
-        &self,
-        id: &str,
-    ) -> Option<Arc<StdMutex<PooledConnection<DuckdbConnectionManager>>>> {
-        let mut guard = self.inner.lock().await;
-        guard.remove(id)
-    }
-}
+// Phase 2 Complete: All state (prepared statements, transactions) is session-scoped
+// - Each gRPC connection gets a dedicated session (based on remote_addr)
+// - Sessions persist across requests from the same connection
+// - Prepared statements and transactions are isolated per session
+// - Automatic cleanup via idle timeout (30min default)
 
 #[derive(Clone)]
 pub struct SwanFlightSqlService {
-    engine: Arc<DuckDbEngine>,
-    transactions: Arc<TransactionManager>,
-    prepared: Arc<PreparedStatementStore>,
-    next_statement_id: Arc<AtomicU64>,
+    registry: Arc<SessionRegistry>,
 }
 
 impl SwanFlightSqlService {
-    pub fn new(engine: Arc<DuckDbEngine>) -> Self {
-        Self {
-            engine,
-            transactions: Arc::new(TransactionManager::default()),
-            prepared: Arc::new(PreparedStatementStore::default()),
-            next_statement_id: Arc::new(AtomicU64::new(1)),
+    pub fn new(registry: Arc<SessionRegistry>) -> Self {
+        Self { registry }
+    }
+
+    /// Extract session ID from tonic Request for session tracking (Phase 2)
+    ///
+    /// This uses the remote peer address as the session ID.
+    /// Sessions persist across requests from the same gRPC connection.
+    fn extract_session_id<T>(request: &Request<T>) -> SessionId {
+        // Use remote address as session ID for connection-based persistence
+        if let Some(addr) = request.remote_addr() {
+            SessionId::from_string(addr.to_string())
+        } else {
+            // Fallback: generate a unique ID per request (Phase 1 behavior)
+            SessionId::from_string(Uuid::new_v4().to_string())
         }
+    }
+
+    /// Get or create a session based on connection (Phase 2: connection-based persistence)
+    ///
+    /// Extracts session ID from the gRPC connection and reuses sessions across requests.
+    fn get_session<T>(&self, request: &Request<T>) -> Result<Arc<Session>, Status> {
+        let session_id = Self::extract_session_id(request);
+        self.registry
+            .get_or_create_by_id(&session_id)
+            .map_err(|e| Self::status_from_error(e))
     }
 
     fn status_from_error(err: ServerError) -> Status {
@@ -175,11 +98,13 @@ impl SwanFlightSqlService {
             ServerError::WritesDisabled => {
                 Status::permission_denied("write operations are disabled by configuration")
             }
-            ServerError::TransactionNotFound(id) => {
-                Status::invalid_argument(format!("unknown transaction '{id}'"))
+            ServerError::TransactionNotFound => Status::invalid_argument("unknown transaction"),
+            ServerError::PreparedStatementNotFound => {
+                Status::invalid_argument("unknown prepared statement")
             }
-            ServerError::PreparedStatementNotFound(handle) => {
-                Status::invalid_argument(format!("unknown prepared statement '{handle}'"))
+            ServerError::SessionNotFound => Status::invalid_argument("session not found"),
+            ServerError::MaxSessionsReached => {
+                Status::resource_exhausted("maximum number of sessions reached")
             }
             ServerError::UnsupportedParameter(param) => {
                 Status::invalid_argument(format!("unsupported parameter type: {param}"))
@@ -259,21 +184,6 @@ impl SwanFlightSqlService {
                 | "TABLE"
                 | "PRAGMA"
         )
-    }
-
-    fn parse_transaction_id(id: &[u8]) -> Result<String, Status> {
-        String::from_utf8(id.to_vec())
-            .map_err(|_| Status::invalid_argument("transaction id must be utf-8"))
-    }
-
-    fn parse_statement_handle(handle: &[u8]) -> Result<String, Status> {
-        String::from_utf8(handle.to_vec())
-            .map_err(|_| Status::invalid_argument("prepared statement handle must be utf-8"))
-    }
-
-    fn allocate_statement_handle(&self) -> Vec<u8> {
-        let id = self.next_statement_id.fetch_add(1, Ordering::Relaxed);
-        format!("stmt-{id}").into_bytes()
     }
 
     async fn collect_parameter_sets(
@@ -445,18 +355,18 @@ impl SwanFlightSqlService {
     }
 
     fn execute_statement_batches(
-        conn: &Connection,
         sql: &str,
-        param_sets: &[Vec<Value>],
+        param_batches: &[Vec<Value>],
+        session: &Session,
     ) -> Result<i64, ServerError> {
-        if param_sets.is_empty() {
-            let affected = DuckDbEngine::execute_statement_on_conn_with_params(conn, sql, &[])?;
+        if param_batches.is_empty() {
+            let affected = session.execute_statement_with_params(sql, &[])?;
             return Ok(affected as i64);
         }
 
         let mut total = 0i64;
-        for params in param_sets {
-            let affected = DuckDbEngine::execute_statement_on_conn_with_params(conn, sql, params)?;
+        for params in param_batches {
+            let affected = session.execute_statement_with_params(sql, params)?;
             total += affected as i64;
         }
         Ok(total)
@@ -464,82 +374,42 @@ impl SwanFlightSqlService {
 
     async fn execute_prepared_query_handle(
         &self,
-        handle: &str,
+        session: &Arc<Session>,
+        handle: &[u8],
         meta: PreparedStatementMeta,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let params = self
-            .prepared
-            .take_parameters(handle)
-            .await
-            .map_err(Self::status_from_error)?;
-        let mut param_sets = params.unwrap_or_else(|| vec![Vec::new()]);
-        if param_sets.is_empty() {
-            param_sets.push(Vec::new());
-        }
-        if param_sets.len() > 1 {
-            return Err(Status::invalid_argument(
-                "multiple parameter batches are not supported for queries",
-            ));
-        }
-        let parameters = param_sets.into_iter().next().unwrap();
+        let parameters = session
+            .take_prepared_statement_parameters(handle)
+            .map_err(Self::status_from_error)?
+            .unwrap_or_else(Vec::new);
 
         info!(
-            handle = handle,
+            handle = ?handle,
             sql = %meta.sql,
-            transaction = meta.transaction_id.as_deref().unwrap_or("auto"),
+            param_count = parameters.len(),
             "executing prepared statement via handle"
         );
+
+        // Execute query on session's connection
+        let sql_for_exec = meta.sql.clone();
+        let params_for_exec = parameters.clone();
+        let session_clone = session.clone();
 
         let QueryResult {
             schema,
             batches,
             total_rows,
             total_bytes,
-        } = if let Some(txn_id) = meta.transaction_id.clone() {
-            let conn_arc = self
-                .transactions
-                .get(&txn_id)
-                .await
-                .map_err(Self::status_from_error)?;
-            let params_for_exec = parameters.clone();
-            let sql_for_exec = meta.sql.clone();
-            let engine = self.engine.clone();
-            tokio::task::spawn_blocking(move || {
-                let guard = conn_arc.lock().expect("transaction connection poisoned");
-                engine.ensure_connection_state(&*guard)?;
-                if params_for_exec.is_empty() {
-                    DuckDbEngine::execute_query_on_conn(&*guard, &sql_for_exec)
-                } else {
-                    DuckDbEngine::execute_query_on_conn_with_params(
-                        &*guard,
-                        &sql_for_exec,
-                        &params_for_exec,
-                    )
-                }
-            })
-            .await
-            .map_err(Self::status_from_join)?
-            .map_err(Self::status_from_error)?
-        } else {
-            let engine = self.engine.clone();
-            let params_for_exec = parameters.clone();
-            let sql_for_exec = meta.sql.clone();
-            tokio::task::spawn_blocking(move || {
-                let conn = engine.get_read_connection()?;
-                if params_for_exec.is_empty() {
-                    DuckDbEngine::execute_query_on_conn(&conn, &sql_for_exec)
-                } else {
-                    DuckDbEngine::execute_query_on_conn_with_params(
-                        &conn,
-                        &sql_for_exec,
-                        &params_for_exec,
-                    )
-                }
-            })
-            .await
-            .map_err(Self::status_from_join)?
-            .map_err(Self::status_from_error)?
-        };
+        } = tokio::task::spawn_blocking(move || {
+            if params_for_exec.is_empty() {
+                session_clone.execute_query(&sql_for_exec)
+            } else {
+                session_clone.execute_query_with_params(&sql_for_exec, &params_for_exec)
+            }
+        })
+        .await
+        .map_err(Self::status_from_join)?
+        .map_err(Self::status_from_error)?;
 
         let flight_data =
             arrow_flight::utils::batches_to_flight_data(&schema, batches).map_err(|err| {
@@ -566,7 +436,7 @@ impl SwanFlightSqlService {
                 .insert("x-swandb-total-bytes", value);
         }
         info!(
-            handle = handle,
+            handle = ?handle,
             total_rows, total_bytes, "prepared statement completed"
         );
         Ok(response)
@@ -584,35 +454,17 @@ impl FlightSqlService for SwanFlightSqlService {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let sql = query.query.clone();
-        let transaction_id = match query.transaction_id.as_ref() {
-            Some(id) => Some(Self::parse_transaction_id(id.as_ref())?),
-            None => None,
-        };
 
         info!(%sql, "planning query via get_flight_info_statement");
 
-        let schema = if let Some(txn_id) = transaction_id.clone() {
-            let conn = self
-                .transactions
-                .get(&txn_id)
-                .await
-                .map_err(Self::status_from_error)?;
-            let sql_for_schema = sql.clone();
-            tokio::task::spawn_blocking(move || {
-                let guard = conn.lock().expect("transaction connection poisoned");
-                DuckDbEngine::schema_for_query_on_conn(&*guard, &sql_for_schema)
-            })
+        // Get session (Phase 2: reuses existing session for same connection)
+        let session = self.get_session(&request)?;
+
+        // Execute schema extraction on session's dedicated connection
+        let schema = tokio::task::spawn_blocking(move || session.schema_for_query(&sql))
             .await
             .map_err(Self::status_from_join)?
-            .map_err(Self::status_from_error)?
-        } else {
-            let engine = self.engine.clone();
-            let sql_for_schema = sql.clone();
-            tokio::task::spawn_blocking(move || engine.schema_for_query(&sql_for_schema))
-                .await
-                .map_err(Self::status_from_join)?
-                .map_err(Self::status_from_error)?
-        };
+            .map_err(Self::status_from_error)?;
 
         debug!(field_count = schema.fields().len(), "planned schema");
 
@@ -634,53 +486,32 @@ impl FlightSqlService for SwanFlightSqlService {
         Ok(Response::new(info))
     }
 
-    #[instrument(skip(self, _request), fields(handle_len = ticket.statement_handle.len()))]
+    #[instrument(skip(self, request), fields(handle_len = ticket.statement_handle.len()))]
     async fn do_get_statement(
         &self,
         ticket: TicketStatementQuery,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let command = CommandStatementQuery::decode(ticket.statement_handle.as_ref())
             .map_err(|err| Status::invalid_argument(format!("invalid statement handle: {err}")))?;
         let sql = command.query.clone();
-        if let Ok(meta) = self.prepared.meta(&sql).await {
-            return self.execute_prepared_query_handle(&sql, meta).await;
-        }
-        let sql_for_exec = sql.clone();
-        let transaction_id = match command.transaction_id.as_ref() {
-            Some(id) => Some(Self::parse_transaction_id(id.as_ref())?),
-            None => None,
-        };
 
         info!(%sql, "executing query via do_get_statement");
 
+        // Get session (Phase 2: reuses existing session for same connection)
+        let session = self.get_session(&request)?;
+
+        // Execute query on session's dedicated connection
+        let sql_clone = sql.clone();
         let QueryResult {
             schema,
             batches,
             total_rows,
             total_bytes,
-        } = if let Some(txn_id) = transaction_id {
-            let conn = self
-                .transactions
-                .get(&txn_id)
-                .await
-                .map_err(Self::status_from_error)?;
-            let engine = self.engine.clone();
-            tokio::task::spawn_blocking(move || {
-                let guard = conn.lock().expect("transaction connection poisoned");
-                engine.ensure_connection_state(&*guard)?;
-                DuckDbEngine::execute_query_on_conn(&*guard, &sql_for_exec)
-            })
+        } = tokio::task::spawn_blocking(move || session.execute_query(&sql_clone))
             .await
             .map_err(Self::status_from_join)?
-            .map_err(Self::status_from_error)?
-        } else {
-            let engine = self.engine.clone();
-            tokio::task::spawn_blocking(move || engine.execute_query(&sql_for_exec))
-                .await
-                .map_err(Self::status_from_join)?
-                .map_err(Self::status_from_error)?
-        };
+            .map_err(Self::status_from_error)?;
 
         let flight_data =
             arrow_flight::utils::batches_to_flight_data(&schema, batches).map_err(|err| {
@@ -823,134 +654,71 @@ impl FlightSqlService for SwanFlightSqlService {
         Ok(Response::new(stream))
     }
 
-    #[instrument(skip(self, _request), fields(sql = %command.query))]
+    #[instrument(skip(self, request), fields(sql = %command.query))]
     async fn do_put_statement_update(
         &self,
         command: CommandStatementUpdate,
-        _request: Request<PeekableFlightDataStream>,
+        request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
         let sql = command.query.clone();
-        let transaction_id = match command.transaction_id.as_ref() {
-            Some(id) => Some(Self::parse_transaction_id(id.as_ref())?),
-            None => None,
-        };
 
         info!(%sql, "executing statement via do_put_statement_update");
 
-        let sql_for_exec = sql.clone();
-        let affected_rows = if let Some(txn_id) = transaction_id {
-            let conn = self
-                .transactions
-                .get(&txn_id)
-                .await
-                .map_err(Self::status_from_error)?;
-            let engine = self.engine.clone();
-            tokio::task::spawn_blocking(move || {
-                let guard = conn.lock().expect("transaction connection poisoned");
-                engine.ensure_connection_state(&*guard)?;
-                DuckDbEngine::execute_statement_on_conn(&*guard, &sql_for_exec)
-            })
-            .await
-            .map_err(Self::status_from_join)?
-            .map_err(Self::status_from_error)?
-        } else {
-            let engine = self.engine.clone();
-            tokio::task::spawn_blocking(move || engine.execute_statement(&sql_for_exec))
+        // Get session (Phase 2: reuses existing session for same connection)
+        let session = self.get_session(&request)?;
+
+        // Execute statement on session's dedicated connection
+        let sql_clone = sql.clone();
+        let affected_rows =
+            tokio::task::spawn_blocking(move || session.execute_statement(&sql_clone))
                 .await
                 .map_err(Self::status_from_join)?
-                .map_err(Self::status_from_error)?
-        };
+                .map_err(Self::status_from_error)?;
 
         info!(%sql, affected_rows, "statement completed");
 
         Ok(affected_rows)
     }
 
-    #[instrument(skip(self, _request), fields(sql = %query.query))]
+    #[instrument(skip(self, request), fields(sql = %query.query, is_query))]
     async fn do_action_create_prepared_statement(
         &self,
         query: ActionCreatePreparedStatementRequest,
-        _request: Request<arrow_flight::Action>,
+        request: Request<arrow_flight::Action>,
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
         let sql = query.query.clone();
         let is_query = Self::is_query_statement(&sql);
-        let transaction_id = match query.transaction_id.as_ref() {
-            Some(id) => Some(Self::parse_transaction_id(id.as_ref())?),
-            None => None,
-        };
 
-        if !is_query && !self.engine.writes_enabled() {
-            return Err(Self::status_from_error(ServerError::WritesDisabled));
-        }
+        info!(%sql, is_query, "creating prepared statement");
 
-        if let Some(ref txn) = transaction_id {
-            // Verify transaction exists
-            let _ = self
-                .transactions
-                .get(txn)
-                .await
-                .map_err(Self::status_from_error)?;
-        }
+        // Get session (Phase 2: reuses existing session for same connection)
+        let session = self.get_session(&request)?;
 
-        info!(
-            %sql,
-            transaction = transaction_id.as_deref().unwrap_or("auto"),
-            "creating prepared statement"
-        );
-
+        // Get schema for queries
         let dataset_schema = if is_query {
-            if let Some(txn_id) = transaction_id.clone() {
-                let conn = self
-                    .transactions
-                    .get(&txn_id)
-                    .await
-                    .map_err(Self::status_from_error)?;
-                let sql_for_schema = sql.clone();
-                let engine = self.engine.clone();
-                tokio::task::spawn_blocking(move || {
-                    let guard = conn.lock().expect("transaction connection poisoned");
-                    engine.ensure_connection_state(&*guard)?;
-                    let schema = DuckDbEngine::schema_for_query_on_conn(&*guard, &sql_for_schema)?;
-                    SwanFlightSqlService::schema_to_ipc_bytes(&schema)
-                })
-                .await
-                .map_err(Self::status_from_join)?
-                .map_err(Self::status_from_error)?
-            } else {
-                let engine = self.engine.clone();
-                let sql_for_schema = sql.clone();
-                tokio::task::spawn_blocking(move || {
-                    let schema = engine.schema_for_query(&sql_for_schema)?;
-                    SwanFlightSqlService::schema_to_ipc_bytes(&schema)
-                })
-                .await
-                .map_err(Self::status_from_join)?
-                .map_err(Self::status_from_error)?
-            }
+            let sql_for_schema = sql.clone();
+            let session_clone = session.clone();
+            tokio::task::spawn_blocking(move || {
+                let schema = session_clone.schema_for_query(&sql_for_schema)?;
+                SwanFlightSqlService::schema_to_ipc_bytes(&schema)
+            })
+            .await
+            .map_err(Self::status_from_join)?
+            .map_err(Self::status_from_error)?
         } else {
             Vec::new()
         };
 
-        let handle_bytes = self.allocate_statement_handle();
-        let handle_string =
-            String::from_utf8(handle_bytes.clone()).expect("statement handle must be utf-8");
-
-        self.prepared
-            .insert(
-                handle_string.clone(),
-                PreparedStatementMeta {
-                    sql: sql.clone(),
-                    is_query,
-                    transaction_id: transaction_id.clone(),
-                },
-            )
-            .await;
+        // Store in session-scoped prepared statement storage (Phase 2)
+        let handle_bytes = session
+            .create_prepared_statement(sql.clone(), is_query, None)
+            .map_err(Self::status_from_error)?;
 
         info!(
-            handle = handle_string,
+            handle = ?handle_bytes,
             schema_len = dataset_schema.len(),
             is_query,
-            "prepared statement created"
+            "prepared statement created in session"
         );
 
         Ok(ActionCreatePreparedStatementResult {
@@ -966,11 +734,13 @@ impl FlightSqlService for SwanFlightSqlService {
         query: CommandPreparedStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let handle = Self::parse_statement_handle(&query.prepared_statement_handle)?;
-        let meta = self
-            .prepared
-            .meta(&handle)
-            .await
+        let handle = &query.prepared_statement_handle;
+
+        // Get session (Phase 2: reuses existing session for same connection)
+        let session = self.get_session(&request)?;
+
+        let meta = session
+            .get_prepared_statement_meta(handle)
             .map_err(Self::status_from_error)?;
 
         if !meta.is_query {
@@ -980,39 +750,22 @@ impl FlightSqlService for SwanFlightSqlService {
         }
 
         info!(
-            handle = handle.as_str(),
+            handle = ?handle,
             sql = %meta.sql,
-            transaction = meta.transaction_id.as_deref().unwrap_or("auto"),
             "getting flight info for prepared statement"
         );
 
-        let schema = if let Some(txn_id) = meta.transaction_id.clone() {
-            let conn = self
-                .transactions
-                .get(&txn_id)
-                .await
-                .map_err(Self::status_from_error)?;
-            let sql_for_schema = meta.sql.clone();
-            let engine = self.engine.clone();
-            tokio::task::spawn_blocking(move || {
-                let guard = conn.lock().expect("transaction connection poisoned");
-                engine.ensure_connection_state(&*guard)?;
-                DuckDbEngine::schema_for_query_on_conn(&*guard, &sql_for_schema)
-            })
-            .await
-            .map_err(Self::status_from_join)?
-            .map_err(Self::status_from_error)?
-        } else {
-            let engine = self.engine.clone();
-            let sql_for_schema = meta.sql.clone();
-            tokio::task::spawn_blocking(move || engine.schema_for_query(&sql_for_schema))
+        // Get schema for the prepared statement
+        let sql_for_schema = meta.sql.clone();
+        let session_clone = session.clone();
+        let schema =
+            tokio::task::spawn_blocking(move || session_clone.schema_for_query(&sql_for_schema))
                 .await
                 .map_err(Self::status_from_join)?
-                .map_err(Self::status_from_error)?
-        };
+                .map_err(Self::status_from_error)?;
 
         debug!(
-            handle = handle.as_str(),
+            handle = ?handle,
             field_count = schema.fields().len(),
             "prepared statement schema retrieved"
         );
@@ -1036,17 +789,19 @@ impl FlightSqlService for SwanFlightSqlService {
         Ok(Response::new(info))
     }
 
-    #[instrument(skip(self, _request), fields(handle_len = query.prepared_statement_handle.len()))]
+    #[instrument(skip(self, request), fields(handle_len = query.prepared_statement_handle.len()))]
     async fn do_get_prepared_statement(
         &self,
         query: CommandPreparedStatementQuery,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let handle = Self::parse_statement_handle(&query.prepared_statement_handle)?;
-        let meta = self
-            .prepared
-            .meta(&handle)
-            .await
+        let handle = &query.prepared_statement_handle;
+
+        // Get session (Phase 2: reuses existing session for same connection)
+        let session = self.get_session(&request)?;
+
+        let meta = session
+            .get_prepared_statement_meta(handle)
             .map_err(Self::status_from_error)?;
 
         if !meta.is_query {
@@ -1055,21 +810,23 @@ impl FlightSqlService for SwanFlightSqlService {
             ));
         }
 
-        self.execute_prepared_query_handle(&handle, meta.clone())
+        self.execute_prepared_query_handle(&session, handle, meta)
             .await
     }
 
-    #[instrument(skip(self, request), fields(handle_len = query.prepared_statement_handle.len()))]
+    #[instrument(skip(self, request))]
     async fn do_put_prepared_statement_query(
         &self,
         query: CommandPreparedStatementQuery,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<DoPutPreparedStatementResult, Status> {
-        let handle = Self::parse_statement_handle(&query.prepared_statement_handle)?;
-        let meta = self
-            .prepared
-            .meta(&handle)
-            .await
+        let handle = &query.prepared_statement_handle;
+
+        // Get session (Phase 2: reuses existing session for same connection)
+        let session = self.get_session(&request)?;
+
+        let meta = session
+            .get_prepared_statement_meta(handle)
             .map_err(Self::status_from_error)?;
 
         if !meta.is_query {
@@ -1079,47 +836,53 @@ impl FlightSqlService for SwanFlightSqlService {
         }
 
         let parameter_sets = Self::collect_parameter_sets(request).await?;
-        self.prepared
-            .set_parameters(&handle, Some(parameter_sets))
-            .await
-            .map_err(Self::status_from_error)?;
+
+        // Use first parameter set (Flight SQL doesn't support batching for queries)
+        if let Some(first_params) = parameter_sets.into_iter().next() {
+            session
+                .set_prepared_statement_parameters(handle, first_params)
+                .map_err(Self::status_from_error)?;
+        }
 
         info!(
-            handle = handle.as_str(),
+            handle = ?handle,
             "parameters bound to prepared statement"
         );
 
-        Ok(DoPutPreparedStatementResult {
-            prepared_statement_handle: None,
-        })
-    }
-
-    #[instrument(skip(self, _request), fields(handle_len = query.prepared_statement_handle.len()))]
-    async fn do_action_close_prepared_statement(
-        &self,
-        query: ActionClosePreparedStatementRequest,
-        _request: Request<arrow_flight::Action>,
-    ) -> Result<(), Status> {
-        let handle = Self::parse_statement_handle(&query.prepared_statement_handle)?;
-        self.prepared
-            .remove(&handle)
-            .await
-            .map_err(Self::status_from_error)?;
-        info!(handle = handle.as_str(), "prepared statement closed");
-        Ok(())
+        Ok(DoPutPreparedStatementResult::default())
     }
 
     #[instrument(skip(self, request), fields(handle_len = query.prepared_statement_handle.len()))]
+    async fn do_action_close_prepared_statement(
+        &self,
+        query: ActionClosePreparedStatementRequest,
+        request: Request<arrow_flight::Action>,
+    ) -> Result<(), Status> {
+        let handle = &query.prepared_statement_handle;
+
+        // Get session (Phase 2: reuses existing session for same connection)
+        let session = self.get_session(&request)?;
+
+        session
+            .close_prepared_statement(handle)
+            .map_err(Self::status_from_error)?;
+        info!(handle = ?handle, "prepared statement closed");
+        Ok(())
+    }
+
+    #[instrument(skip(self, request))]
     async fn do_put_prepared_statement_update(
         &self,
         query: CommandPreparedStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        let handle = Self::parse_statement_handle(&query.prepared_statement_handle)?;
-        let meta = self
-            .prepared
-            .meta(&handle)
-            .await
+        let handle = &query.prepared_statement_handle;
+
+        // Get session (Phase 2: reuses existing session for same connection)
+        let session = self.get_session(&request)?;
+
+        let meta = session
+            .get_prepared_statement_meta(handle)
             .map_err(Self::status_from_error)?;
 
         if meta.is_query {
@@ -1128,122 +891,86 @@ impl FlightSqlService for SwanFlightSqlService {
             ));
         }
 
-        let mut parameter_sets = Self::collect_parameter_sets(request).await?;
-        if parameter_sets.is_empty() {
-            parameter_sets.push(Vec::new());
-        }
+        let parameter_sets = Self::collect_parameter_sets(request).await?;
 
         info!(
-            handle = handle.as_str(),
+            handle = ?handle,
             sql = %meta.sql,
-            transaction = meta.transaction_id.as_deref().unwrap_or("auto"),
-            "executing prepared statement update via do_put_prepared_statement_update"
+            parameter_sets = parameter_sets.len(),
+            "executing prepared statement update"
         );
 
-        let affected_rows = if let Some(txn_id) = meta.transaction_id.clone() {
-            let conn_arc = self
-                .transactions
-                .get(&txn_id)
-                .await
-                .map_err(Self::status_from_error)?;
-            let sql_for_exec = meta.sql.clone();
-            let params = parameter_sets.clone();
-            tokio::task::spawn_blocking(move || {
-                let guard = conn_arc.lock().expect("transaction connection poisoned");
-                SwanFlightSqlService::execute_statement_batches(&*guard, &sql_for_exec, &params)
-            })
-            .await
-            .map_err(Self::status_from_join)?
-            .map_err(Self::status_from_error)?
-        } else {
-            let engine = self.engine.clone();
-            let sql_for_exec = meta.sql.clone();
-            let params = parameter_sets.clone();
-            tokio::task::spawn_blocking(move || {
-                let conn = engine.get_write_connection()?;
-                SwanFlightSqlService::execute_statement_batches(&conn, &sql_for_exec, &params)
-            })
-            .await
-            .map_err(Self::status_from_join)?
-            .map_err(Self::status_from_error)?
-        };
+        // Execute statement batches with session connection
+        let sql_for_exec = meta.sql.clone();
+        let params = parameter_sets.clone();
+        let session_clone = session.clone();
 
-        info!(
-            handle = handle.as_str(),
-            affected_rows, "prepared statement update completed"
-        );
-
-        Ok(affected_rows)
-    }
-
-    #[instrument(skip(self, _request))]
-    async fn do_action_begin_transaction(
-        &self,
-        _query: ActionBeginTransactionRequest,
-        _request: Request<arrow_flight::Action>,
-    ) -> Result<ActionBeginTransactionResult, Status> {
-        if !self.engine.writes_enabled() {
-            return Err(Self::status_from_error(ServerError::WritesDisabled));
-        }
-
-        debug!("do_action_begin_transaction called");
-
-        let engine = self.engine.clone();
-        let transaction_id = format!(
-            "txn_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-
-        let txn_id_clone = transaction_id.clone();
-        let conn = tokio::task::spawn_blocking(move || {
-            let conn = engine.get_write_connection()?;
-            conn.execute_batch("BEGIN TRANSACTION")?;
-            Ok::<_, ServerError>(conn)
+        let affected_rows = tokio::task::spawn_blocking(move || {
+            SwanFlightSqlService::execute_statement_batches(&sql_for_exec, &params, &session_clone)
         })
         .await
         .map_err(Self::status_from_join)?
         .map_err(Self::status_from_error)?;
 
-        self.transactions.insert(txn_id_clone.clone(), conn).await;
+        info!(
+            handle = ?handle,
+            affected_rows,
+            "prepared statement update complete"
+        );
+        Ok(affected_rows)
+    }
 
-        info!(transaction_id = txn_id_clone, "transaction started");
+    #[instrument(skip(self, request))]
+    async fn do_action_begin_transaction(
+        &self,
+        _query: ActionBeginTransactionRequest,
+        request: Request<arrow_flight::Action>,
+    ) -> Result<ActionBeginTransactionResult, Status> {
+        debug!("do_action_begin_transaction called");
+
+        // Get session (Phase 2: reuses existing session for same connection)
+        let session = self.get_session(&request)?;
+
+        // Begin transaction on session's connection
+        let session_clone = session.clone();
+        let transaction_id = tokio::task::spawn_blocking(move || session_clone.begin_transaction())
+            .await
+            .map_err(Self::status_from_join)?
+            .map_err(Self::status_from_error)?;
+
+        info!(transaction_id = ?transaction_id, "transaction started in session");
 
         Ok(ActionBeginTransactionResult {
-            transaction_id: transaction_id.into_bytes().into(),
+            transaction_id: transaction_id.into(),
         })
     }
 
-    #[instrument(skip(self, _request), fields(transaction_id))]
+    #[instrument(skip(self, request), fields(transaction_id))]
     async fn do_action_end_transaction(
         &self,
         query: ActionEndTransactionRequest,
-        _request: Request<arrow_flight::Action>,
+        request: Request<arrow_flight::Action>,
     ) -> Result<(), Status> {
-        let transaction_id = String::from_utf8(query.transaction_id.to_vec())
-            .map_err(|_| Status::invalid_argument("invalid transaction id encoding"))?;
+        let transaction_id = query.transaction_id.to_vec();
 
-        tracing::Span::current().record("transaction_id", &transaction_id);
+        tracing::Span::current().record("transaction_id", format!("{:?}", transaction_id).as_str());
 
         let action = query.action;
-        debug!(transaction_id, action, "do_action_end_transaction called");
+        debug!(transaction_id = ?transaction_id, action, "do_action_end_transaction called");
 
-        let conn_arc = match self.transactions.remove(&transaction_id).await {
-            Some(conn) => conn,
-            None => {
-                return Err(Self::status_from_error(ServerError::TransactionNotFound(
-                    transaction_id,
-                )))
-            }
-        };
+        // Get session (Phase 2: reuses existing session for same connection)
+        let session = self.get_session(&request)?;
+
+        // Commit or rollback transaction on session's connection
+        let session_clone = session.clone();
+        let txn_id_clone = transaction_id.clone();
 
         let commit_result = tokio::task::spawn_blocking(move || {
-            let guard = conn_arc.lock().expect("transaction connection poisoned");
-            let sql = if action == 0 { "COMMIT" } else { "ROLLBACK" };
-            guard.execute_batch(sql)?;
-            Ok::<_, ServerError>(())
+            if action == 0 {
+                session_clone.commit_transaction(&txn_id_clone)
+            } else {
+                session_clone.rollback_transaction(&txn_id_clone)
+            }
         })
         .await
         .map_err(Self::status_from_join)?
@@ -1260,7 +987,7 @@ impl FlightSqlService for SwanFlightSqlService {
                         .contains("Cannot commit when autocommit is enabled")
                 {
                     info!(
-                        transaction_id,
+                        transaction_id = ?transaction_id,
                         "commit requested while autocommit enabled; treated as no-op"
                     );
                 } else if action != 0
@@ -1269,7 +996,7 @@ impl FlightSqlService for SwanFlightSqlService {
                         .contains("cannot rollback when autocommit is enabled")
                 {
                     info!(
-                        transaction_id,
+                        transaction_id = ?transaction_id,
                         "rollback requested while autocommit enabled; treated as no-op"
                     );
                 } else {
@@ -1278,11 +1005,12 @@ impl FlightSqlService for SwanFlightSqlService {
             }
         }
 
-        if action == 0 {
-            info!(transaction_id, "transaction committed");
+        let op = if action == 0 {
+            "committed"
         } else {
-            info!(transaction_id, "transaction rolled back");
-        }
+            "rolled back"
+        };
+        info!(transaction_id = ?transaction_id, op, "transaction completed in session");
 
         Ok(())
     }

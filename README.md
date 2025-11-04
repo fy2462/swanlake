@@ -48,7 +48,8 @@ The server listens on `127.0.0.1:4214` by default and can be configured through 
 | `SWANDB_HOST` | Address to bind the Flight SQL server | `127.0.0.1` |
 | `SWANDB_PORT` | TCP port for the Flight SQL server | `4214` |
 | `SWANDB_DUCKDB_PATH` | Optional path to a DuckDB database file (in-memory when omitted) | _in-memory_ |
-| `SWANDB_POOL_SIZE` | Maximum number of pooled DuckDB connections | `4` |
+| `SWANDB_MAX_SESSIONS` | Maximum number of concurrent client sessions | `100` |
+| `SWANDB_SESSION_TIMEOUT_SECONDS` | Idle session timeout in seconds | `1800` |
 | `SWANDB_ENABLE_DUCKLAKE` | Toggle automatic `ducklake` extension install/load | `true` |
 | `SWANDB_DUCKLAKE_INIT_SQL` | Optional SQL executed after the extension loads (e.g. ATTACH commands) | _unset_ |
 
@@ -122,11 +123,12 @@ See [OPTIMIZATIONS.md](OPTIMIZATIONS.md) for detailed performance documentation.
 ## Architecture overview
 
 - `config`: loads runtime configuration from the environment.
-- `duckdb`: thin query engine that fans out synchronous DuckDB work into blocking tasks, manages an r2d2-backed DuckDB pool, installs/loads the DuckLake extension, and exposes results as Arrow batches.
+- `engine/`: connection factory that creates initialized DuckDB connections with extensions and optimizations.
+- `session/`: session management with dedicated connections, prepared statements, transactions, and automatic cleanup.
 - `service`: minimal [`FlightSqlService`](https://docs.rs/arrow-flight/latest/arrow_flight/sql/server/trait.FlightSqlService.html) implementation that handles `CommandStatementQuery` (SELECT queries) and `CommandStatementUpdate` (DDL/DML statements) and streams results via Arrow Flight.
-- `main`: wires configuration, logging, and the Flight SQL gRPC server together.
+- `main`: wires configuration, logging, the Flight SQL gRPC server, and idle session cleanup together.
 
-The implementation keeps the DuckDB engine simple on purpose—queries are executed directly and the resulting `RecordBatch`es are converted to Flight `FlightData`. DuckLake is handled as a DuckDB extension: we install/load it at startup (unless disabled) and optionally run custom SQL afterwards so we fail fast if attachment fails. Connection management is delegated to an r2d2 pool so concurrent RPCs get cheap cloned handles.
+The implementation uses a session-based architecture where each client gets a dedicated DuckDB connection with persistent state. Queries are executed directly and the resulting `RecordBatch`es are converted to Flight `FlightData`. DuckLake is handled as a DuckDB extension: we install/load it at connection creation (unless disabled) and optionally run custom SQL afterwards so we fail fast if attachment fails. Sessions are automatically cleaned up after 30 minutes of inactivity.
 
 ### Flight SQL Operations
 

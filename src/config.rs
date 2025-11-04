@@ -22,6 +22,10 @@ pub struct ServerConfig {
     pub ducklake_init_sql: Option<String>,
     /// Whether to start the UI server automatically.
     pub enable_ui_server: bool,
+    /// Maximum number of concurrent sessions.
+    pub max_sessions: Option<usize>,
+    /// Session idle timeout in seconds.
+    pub session_timeout_seconds: Option<u64>,
 }
 
 impl Default for ServerConfig {
@@ -36,6 +40,8 @@ impl Default for ServerConfig {
             ducklake_enable: true,
             ducklake_init_sql: None,
             enable_ui_server: true,
+            max_sessions: Some(100),
+            session_timeout_seconds: Some(1800), // 30 minutes
         }
     }
 }

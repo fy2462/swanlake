@@ -10,10 +10,14 @@ pub enum ServerError {
     Pool(#[from] r2d2::Error),
     #[error("write operations are disabled by configuration")]
     WritesDisabled,
-    #[error("transaction not found: {0}")]
-    TransactionNotFound(String),
-    #[error("prepared statement not found: {0}")]
-    PreparedStatementNotFound(String),
+    #[error("transaction not found")]
+    TransactionNotFound,
+    #[error("prepared statement not found")]
+    PreparedStatementNotFound,
+    #[error("session not found")]
+    SessionNotFound,
+    #[error("maximum number of sessions reached")]
+    MaxSessionsReached,
     #[error("unsupported parameter type: {0}")]
     UnsupportedParameter(String),
 }
