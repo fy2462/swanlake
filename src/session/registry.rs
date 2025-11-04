@@ -94,7 +94,6 @@ impl SessionRegistry {
     /// The session_id is derived from the connection info (e.g., remote address).
     /// If a session already exists with this ID, it is reused.
     /// Otherwise, a new session is created with the given ID.
-    #[instrument(skip(self))]
     pub fn get_or_create_by_id(&self, session_id: &SessionId) -> Result<Arc<Session>, ServerError> {
         // First, try to get existing session (read lock)
         {

@@ -81,6 +81,17 @@ impl SwanFlightSqlService {
             .map_err(|e| Self::status_from_error(e))
     }
 
+    /// Prepare request: extract session_id, record to tracing span, and get/create session
+    ///
+    /// This centralizes the common pattern of session management in handlers.
+    fn prepare_request<T>(&self, request: &Request<T>) -> Result<Arc<Session>, Status> {
+        let session_id = Self::extract_session_id(request);
+        tracing::Span::current().record("session_id", session_id.as_ref());
+        self.registry
+            .get_or_create_by_id(&session_id)
+            .map_err(Self::status_from_error)
+    }
+
     fn status_from_error(err: ServerError) -> Status {
         match err {
             ServerError::DuckDb(e) => {
@@ -96,17 +107,24 @@ impl SwanFlightSqlService {
                 Status::internal(format!("connection pool error: {e}"))
             }
             ServerError::WritesDisabled => {
+                error!("write operations are disabled by configuration");
                 Status::permission_denied("write operations are disabled by configuration")
             }
-            ServerError::TransactionNotFound => Status::invalid_argument("unknown transaction"),
+            ServerError::TransactionNotFound => {
+                error!("unknown transaction");
+                Status::invalid_argument("unknown transaction")
+            }
             ServerError::PreparedStatementNotFound => {
+                error!("unknown prepared statement");
                 Status::invalid_argument("unknown prepared statement")
             }
 
             ServerError::MaxSessionsReached => {
+                error!("maximum number of sessions reached");
                 Status::resource_exhausted("maximum number of sessions reached")
             }
             ServerError::UnsupportedParameter(param) => {
+                error!(param = %param, "unsupported parameter type");
                 Status::invalid_argument(format!("unsupported parameter type: {param}"))
             }
         }
@@ -124,8 +142,14 @@ impl SwanFlightSqlService {
 
     fn status_from_flight_error(err: FlightError) -> Status {
         match err {
-            FlightError::Tonic(status) => *status,
-            other => Status::internal(format!("flight decode error: {other}")),
+            FlightError::Tonic(status) => {
+                error!(status = ?status, "tonic flight error");
+                *status
+            }
+            other => {
+                error!(error = %other, "flight decode error");
+                Status::internal(format!("flight decode error: {other}"))
+            }
         }
     }
 
@@ -447,18 +471,14 @@ impl SwanFlightSqlService {
 impl FlightSqlService for SwanFlightSqlService {
     type FlightService = SwanFlightSqlService;
 
-    #[instrument(skip(self, request), fields(sql = %query.query))]
+    #[instrument(skip(self, request), fields(session_id, sql = %query.query))]
     async fn get_flight_info_statement(
         &self,
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let sql = query.query.clone();
-
-        info!(%sql, "planning query via get_flight_info_statement");
-
-        // Get session (Phase 2: reuses existing session for same connection)
-        let session = self.get_session(&request)?;
+        let session = self.prepare_request(&request)?;
 
         // Execute schema extraction on session's dedicated connection
         let schema = tokio::task::spawn_blocking(move || session.schema_for_query(&sql))
@@ -486,7 +506,7 @@ impl FlightSqlService for SwanFlightSqlService {
         Ok(Response::new(info))
     }
 
-    #[instrument(skip(self, request), fields(handle_len = ticket.statement_handle.len()))]
+    #[instrument(skip(self, request), fields(session_id, sql))]
     async fn do_get_statement(
         &self,
         ticket: TicketStatementQuery,
@@ -543,7 +563,6 @@ impl FlightSqlService for SwanFlightSqlService {
             .await
             .map_err(Self::status_from_join)?
             .map_err(Self::status_from_error)?;
-
         let flight_data =
             arrow_flight::utils::batches_to_flight_data(&schema, batches).map_err(|err| {
                 error!(%err, "failed to convert record batches to flight data");
@@ -567,7 +586,6 @@ impl FlightSqlService for SwanFlightSqlService {
                 .metadata_mut()
                 .insert("x-swandb-total-bytes", value);
         }
-        info!(%sql, total_rows, total_bytes, "query completed");
         Ok(response)
     }
 
@@ -575,13 +593,13 @@ impl FlightSqlService for SwanFlightSqlService {
         // No-op: we don't need to register info dynamically
     }
 
-    #[instrument(skip(self, request))]
+    #[instrument(skip(self, request), fields(session_id))]
     async fn get_flight_info_sql_info(
         &self,
         query: CommandGetSqlInfo,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        debug!("get_flight_info_sql_info called");
+        self.prepare_request(&request)?;
 
         // Build SQL info metadata to get schema
         let mut builder = SqlInfoDataBuilder::new();
@@ -625,17 +643,16 @@ impl FlightSqlService for SwanFlightSqlService {
             .with_endpoint(endpoint)
             .with_total_records(-1); // Unknown number of records
 
-        debug!("Returning FlightInfo for SqlInfo");
         Ok(Response::new(info))
     }
 
-    #[instrument(skip(self, _request))]
+    #[instrument(skip(self, request), fields(session_id))]
     async fn do_get_sql_info(
         &self,
         query: CommandGetSqlInfo,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        debug!("do_get_sql_info called");
+        self.prepare_request(&request)?;
 
         // Build SQL info metadata
         let mut builder = SqlInfoDataBuilder::new();
@@ -670,7 +687,6 @@ impl FlightSqlService for SwanFlightSqlService {
             .map_err(|e| Status::internal(format!("Failed to build SqlInfo response: {}", e)))?;
 
         let schema = batch.schema();
-        debug!("Returning SqlInfo with {} rows", batch.num_rows());
 
         // Convert to Flight data stream
         let flight_data = arrow_flight::utils::batches_to_flight_data(&schema, vec![batch])
@@ -685,18 +701,14 @@ impl FlightSqlService for SwanFlightSqlService {
         Ok(Response::new(stream))
     }
 
-    #[instrument(skip(self, request), fields(sql = %command.query))]
+    #[instrument(skip(self, request), fields(session_id, sql = %command.query))]
     async fn do_put_statement_update(
         &self,
         command: CommandStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
         let sql = command.query.clone();
-
-        info!(%sql, "executing statement via do_put_statement_update");
-
-        // Get session (Phase 2: reuses existing session for same connection)
-        let session = self.get_session(&request)?;
+        let session = self.prepare_request(&request)?;
 
         // Execute statement on session's dedicated connection
         let sql_clone = sql.clone();
@@ -706,12 +718,10 @@ impl FlightSqlService for SwanFlightSqlService {
                 .map_err(Self::status_from_join)?
                 .map_err(Self::status_from_error)?;
 
-        info!(%sql, affected_rows, "statement completed");
-
         Ok(affected_rows)
     }
 
-    #[instrument(skip(self, request), fields(sql = %query.query, is_query))]
+    #[instrument(skip(self, request), fields(session_id, sql = %query.query, is_query))]
     async fn do_action_create_prepared_statement(
         &self,
         query: ActionCreatePreparedStatementRequest,
@@ -719,11 +729,8 @@ impl FlightSqlService for SwanFlightSqlService {
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
         let sql = query.query.clone();
         let is_query = Self::is_query_statement(&sql);
-
-        info!(%sql, is_query, "creating prepared statement");
-
-        // Get session (Phase 2: reuses existing session for same connection)
-        let session = self.get_session(&request)?;
+        tracing::Span::current().record("is_query", is_query);
+        let session = self.prepare_request(&request)?;
 
         // Get schema for queries
         let dataset_schema = if is_query {
@@ -759,20 +766,20 @@ impl FlightSqlService for SwanFlightSqlService {
         })
     }
 
-    #[instrument(skip(self, request), fields(handle_len = query.prepared_statement_handle.len()))]
+    #[instrument(skip(self, request), fields(session_id, sql))]
     async fn get_flight_info_prepared_statement(
         &self,
         query: CommandPreparedStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let handle = &query.prepared_statement_handle;
-
-        // Get session (Phase 2: reuses existing session for same connection)
-        let session = self.get_session(&request)?;
+        let session = self.prepare_request(&request)?;
 
         let meta = session
             .get_prepared_statement_meta(handle)
             .map_err(Self::status_from_error)?;
+
+        tracing::Span::current().record("sql", meta.sql.as_str());
 
         if !meta.is_query {
             return Err(Status::invalid_argument(
@@ -820,20 +827,20 @@ impl FlightSqlService for SwanFlightSqlService {
         Ok(Response::new(info))
     }
 
-    #[instrument(skip(self, request), fields(handle_len = query.prepared_statement_handle.len()))]
+    #[instrument(skip(self, request), fields(session_id, sql))]
     async fn do_get_prepared_statement(
         &self,
         query: CommandPreparedStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let handle = &query.prepared_statement_handle;
-
-        // Get session (Phase 2: reuses existing session for same connection)
-        let session = self.get_session(&request)?;
+        let session = self.prepare_request(&request)?;
 
         let meta = session
             .get_prepared_statement_meta(handle)
             .map_err(Self::status_from_error)?;
+
+        tracing::Span::current().record("sql", meta.sql.as_str());
 
         if !meta.is_query {
             return Err(Status::invalid_argument(
@@ -845,20 +852,20 @@ impl FlightSqlService for SwanFlightSqlService {
             .await
     }
 
-    #[instrument(skip(self, request))]
+    #[instrument(skip(self, request), fields(session_id, sql))]
     async fn do_put_prepared_statement_query(
         &self,
         query: CommandPreparedStatementQuery,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<DoPutPreparedStatementResult, Status> {
         let handle = &query.prepared_statement_handle;
-
-        // Get session (Phase 2: reuses existing session for same connection)
-        let session = self.get_session(&request)?;
+        let session = self.prepare_request(&request)?;
 
         let meta = session
             .get_prepared_statement_meta(handle)
             .map_err(Self::status_from_error)?;
+
+        tracing::Span::current().record("sql", meta.sql.as_str());
 
         if !meta.is_query {
             return Err(Status::invalid_argument(
@@ -883,16 +890,14 @@ impl FlightSqlService for SwanFlightSqlService {
         Ok(DoPutPreparedStatementResult::default())
     }
 
-    #[instrument(skip(self, request), fields(handle_len = query.prepared_statement_handle.len()))]
+    #[instrument(skip(self, request), fields(session_id))]
     async fn do_action_close_prepared_statement(
         &self,
         query: ActionClosePreparedStatementRequest,
         request: Request<arrow_flight::Action>,
     ) -> Result<(), Status> {
         let handle = &query.prepared_statement_handle;
-
-        // Get session (Phase 2: reuses existing session for same connection)
-        let session = self.get_session(&request)?;
+        let session = self.prepare_request(&request)?;
 
         session
             .close_prepared_statement(handle)
@@ -901,20 +906,20 @@ impl FlightSqlService for SwanFlightSqlService {
         Ok(())
     }
 
-    #[instrument(skip(self, request))]
+    #[instrument(skip(self, request), fields(session_id, sql))]
     async fn do_put_prepared_statement_update(
         &self,
         query: CommandPreparedStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
         let handle = &query.prepared_statement_handle;
-
-        // Get session (Phase 2: reuses existing session for same connection)
-        let session = self.get_session(&request)?;
+        let session = self.prepare_request(&request)?;
 
         let meta = session
             .get_prepared_statement_meta(handle)
             .map_err(Self::status_from_error)?;
+
+        tracing::Span::current().record("sql", meta.sql.as_str());
 
         if meta.is_query {
             return Err(Status::invalid_argument(
@@ -951,16 +956,13 @@ impl FlightSqlService for SwanFlightSqlService {
         Ok(affected_rows)
     }
 
-    #[instrument(skip(self, request))]
+    #[instrument(skip(self, request), fields(session_id))]
     async fn do_action_begin_transaction(
         &self,
         _query: ActionBeginTransactionRequest,
         request: Request<arrow_flight::Action>,
     ) -> Result<ActionBeginTransactionResult, Status> {
-        debug!("do_action_begin_transaction called");
-
-        // Get session (Phase 2: reuses existing session for same connection)
-        let session = self.get_session(&request)?;
+        let session = self.prepare_request(&request)?;
 
         // Begin transaction on session's connection
         let session_clone = session.clone();
@@ -976,21 +978,18 @@ impl FlightSqlService for SwanFlightSqlService {
         })
     }
 
-    #[instrument(skip(self, request), fields(transaction_id))]
+    #[instrument(skip(self, request), fields(session_id, transaction_id))]
     async fn do_action_end_transaction(
         &self,
         query: ActionEndTransactionRequest,
         request: Request<arrow_flight::Action>,
     ) -> Result<(), Status> {
-        let transaction_id = query.transaction_id.to_vec();
+        let session = self.prepare_request(&request)?;
 
+        let transaction_id = query.transaction_id.to_vec();
         tracing::Span::current().record("transaction_id", format!("{:?}", transaction_id).as_str());
 
         let action = query.action;
-        debug!(transaction_id = ?transaction_id, action, "do_action_end_transaction called");
-
-        // Get session (Phase 2: reuses existing session for same connection)
-        let session = self.get_session(&request)?;
 
         // Commit or rollback transaction on session's connection
         let session_clone = session.clone();

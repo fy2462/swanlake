@@ -59,9 +59,7 @@ fn init_tracing() {
         .unwrap_or_else(|_| EnvFilter::new("info,swandb::service=debug"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_thread_names(true)
+        .with_target(false)
         .with_file(true)
         .with_line_number(true)
         .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)

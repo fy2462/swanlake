@@ -54,7 +54,6 @@ impl DuckDbConnection {
     /// 3. Return schema WITHOUT scanning data
     ///
     /// **Performance Impact:** ~20x faster than full execution
-    #[instrument(skip(self), fields(sql = %sql))]
     pub fn schema_for_query(&self, sql: &str) -> Result<Schema, ServerError> {
         if sql.contains('\0') {
             return Err(ServerError::UnsupportedParameter(
