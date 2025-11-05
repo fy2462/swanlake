@@ -6,7 +6,8 @@
 /ducklake_meta/
 ducklake*
 
-# Go
 examples/go-adbc/go-adbc
-examples/go-adbc/go-sqlx
+examples/go-sqlx/go-sqlx
 tests/runner-go/runner-go
+examples/rust-adbc/target
+examples/rust-adbc/Cargo.lock

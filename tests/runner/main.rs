@@ -1,17 +1,27 @@
 use std::collections::HashMap;
+use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process;
+use std::sync::{Arc, Once};
 
+use adbc_core::{
+    error::Status as AdbcStatus,
+    options::{AdbcVersion, OptionDatabase, OptionValue},
+    Connection,
+    Database,
+    Driver,
+    Statement, // It's required for trait bounds
+};
+use adbc_driver_flightsql::DRIVER_PATH;
+use adbc_driver_manager::{ManagedConnection, ManagedDriver};
 use anyhow::{anyhow, bail, Context, Result};
-use arrow_array::Array;
+use arrow_array::{Array, RecordBatchReader};
 use arrow_cast::display::array_value_to_string;
-use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use futures::StreamExt;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType, Runner};
 use thiserror::Error;
-use tonic::transport::{Channel, Endpoint};
+use tracing::{info, warn};
 
 #[derive(Debug, Error)]
 enum RunnerError {
@@ -21,19 +31,34 @@ enum RunnerError {
 
 #[derive(Clone)]
 struct FlightSqlDb {
-    client: FlightSqlServiceClient<Channel>,
+    connection: Option<ManagedConnection>,
     substitutions: Arc<HashMap<String, String>>,
 }
 
 impl FlightSqlDb {
     async fn connect(endpoint: &str, substitutions: Arc<HashMap<String, String>>) -> Result<Self> {
-        let channel = Endpoint::from_shared(endpoint.to_string())?
-            .connect()
-            .await
-            .context("failed to connect to Flight SQL endpoint")?;
-        let client = FlightSqlServiceClient::new(channel);
+        let uri = endpoint.trim().to_string();
+        info!("Loading Flight SQL driver and connecting to {uri}");
+        let driver_path = PathBuf::from(DRIVER_PATH);
+        let mut driver =
+            ManagedDriver::load_dynamic_from_filename(&driver_path, None, AdbcVersion::default())
+                .map_err(|err| {
+                anyhow!(
+                    "failed to load Flight SQL driver from {}: {err}",
+                    driver_path.display()
+                )
+            })?;
+
+        let database = driver
+            .new_database_with_opts([(OptionDatabase::Uri, OptionValue::from(uri.as_str()))])
+            .map_err(|err| anyhow!("failed to create database handle: {err}"))?;
+        let connection = database
+            .new_connection()
+            .map_err(|err| anyhow!("failed to create connection: {err}"))?;
+        info!("Flight SQL connection established to {uri}");
+
         Ok(Self {
-            client,
+            connection: Some(connection),
             substitutions,
         })
     }
@@ -48,67 +73,62 @@ impl FlightSqlDb {
 
     async fn execute_statement(&mut self, sql: &str) -> Result<DBOutput<DefaultColumnType>> {
         let substituted = self.apply_substitutions(sql);
+        info!("Executing SQL: {substituted}");
+        let conn = self
+            .connection
+            .as_mut()
+            .context("database connection has been shut down")?;
 
-        // Step 1: Create prepared statement to detect query vs statement
-        let prepared = self
-            .client
-            .prepare(substituted.clone(), None)
-            .await
-            .map_err(|err| anyhow!("Flight SQL prepare failed: {}", err))?;
+        let mut statement = conn
+            .new_statement()
+            .map_err(|err| anyhow!("failed to create statement: {err}"))?;
+        statement
+            .set_sql_query(&substituted)
+            .map_err(|err| anyhow!("failed to set SQL query: {err}"))?;
 
-        // Step 2: Check if it's a query or statement based on schema
-        let schema = prepared
-            .dataset_schema()
-            .context("failed to get dataset schema")?;
-        let is_query = !schema.fields().is_empty();
+        let is_query = match statement.execute_schema() {
+            Ok(schema) => !schema.fields().is_empty(),
+            Err(err) => match err.status {
+                AdbcStatus::NotImplemented | AdbcStatus::Unknown => {
+                    infer_query_from_sql(&substituted)
+                }
+                _ => return Err(anyhow!("failed to inspect query schema: {err}")),
+            },
+        };
+        info!(
+            "Treating statement as {}",
+            if is_query { "query" } else { "command" }
+        );
 
         if is_query {
-            // Query path: use GetFlightInfo + DoGet
-            let mut info = self
-                .client
-                .execute(substituted.clone(), None)
-                .await
-                .map_err(|err| anyhow!("Flight SQL execute failed: {}", err))?;
-            let schema = info
-                .clone()
-                .try_decode_schema()
-                .context("failed to decode result schema")?;
+            let reader = statement
+                .execute()
+                .map_err(|err| anyhow!("failed to execute query: {err}"))?;
+            let schema = reader.schema();
 
             let mut rows = Vec::new();
-            let mut _total_rows: u64 = 0;
-            for endpoint in info.endpoint.drain(..) {
-                if let Some(ticket) = endpoint.ticket {
-                    let mut stream = self
-                        .client
-                        .do_get(ticket)
-                        .await
-                        .map_err(|err| anyhow!("Flight SQL do_get failed: {}", err))?;
-                    while let Some(batch) = stream
-                        .next()
-                        .await
-                        .transpose()
-                        .map_err(|err| anyhow!("error reading result batch: {}", err))?
-                    {
-                        let column_count = batch.num_columns();
-                        for row_idx in 0..batch.num_rows() {
-                            let mut row = Vec::with_capacity(column_count);
-                            for col_idx in 0..column_count {
-                                let column = batch.column(col_idx);
-                                if column.is_null(row_idx) {
-                                    row.push("NULL".to_string());
-                                } else {
-                                    row.push(
-                                        array_value_to_string(column.as_ref(), row_idx)
-                                            .context("failed to render value")?,
-                                    );
-                                }
-                            }
-                            _total_rows += 1;
-                            rows.push(row);
+            let mut row_count = 0usize;
+            for batch in reader {
+                let batch = batch.map_err(|err| anyhow!("failed to read result batch: {err}"))?;
+                let column_count = batch.num_columns();
+                for row_idx in 0..batch.num_rows() {
+                    let mut row = Vec::with_capacity(column_count);
+                    for col_idx in 0..column_count {
+                        let column = batch.column(col_idx);
+                        if column.is_null(row_idx) {
+                            row.push("NULL".to_string());
+                        } else {
+                            row.push(
+                                array_value_to_string(column.as_ref(), row_idx)
+                                    .context("failed to render value")?,
+                            );
                         }
                     }
+                    rows.push(row);
+                    row_count += 1;
                 }
             }
+            info!("Query completed with {row_count} row(s) returned");
 
             let types = schema
                 .fields()
@@ -117,16 +137,32 @@ impl FlightSqlDb {
                 .collect();
             Ok(DBOutput::Rows { types, rows })
         } else {
-            // Statement path: use DoPut for updates/DDL
-            let affected_rows = self
-                .client
-                .execute_update(substituted.clone(), None)
-                .await
-                .map_err(|err| anyhow!("Flight SQL execute_update failed: {}", err))?;
-
-            Ok(DBOutput::StatementComplete(affected_rows as u64))
+            let affected = statement
+                .execute_update()
+                .map_err(|err| anyhow!("failed to execute statement: {err}"))?;
+            let affected = affected
+                .and_then(|value| value.try_into().ok())
+                .unwrap_or(0);
+            info!("Command completed with {affected} row(s) affected");
+            Ok(DBOutput::StatementComplete(affected))
         }
     }
+}
+
+fn infer_query_from_sql(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let first_token = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        first_token.as_str(),
+        "select" | "with" | "show" | "describe" | "explain" | "values"
+    )
 }
 
 #[async_trait]
@@ -139,7 +175,11 @@ impl AsyncDB for FlightSqlDb {
     }
 
     async fn shutdown(&mut self) {
-        let _ = self.client.close().await;
+        if self.connection.take().is_some() {
+            info!("Flight SQL connection closed");
+        } else {
+            warn!("Flight SQL connection already closed");
+        }
     }
 
     fn engine_name(&self) -> &str {
@@ -156,7 +196,7 @@ struct CliArgs {
 
 fn parse_args<I: IntoIterator<Item = String>>(args_iter: I) -> Result<CliArgs> {
     let mut args = args_iter.into_iter();
-    let mut endpoint = String::from("http://127.0.0.1:4214");
+    let mut endpoint = String::from("grpc://127.0.0.1:4214");
     let mut labels = Vec::new();
     let mut vars = HashMap::new();
     let mut test_files = Vec::new();
@@ -277,11 +317,37 @@ fn column_type_from_arrow(data_type: &DataType) -> DefaultColumnType {
     }
 }
 
-#[tokio::test]
-async fn run_sqllogictest() -> Result<()> {
-    let args = parse_args(vec!["tests/sql/ducklake_basic.test".to_string()])?;
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
+    init_logging();
 
+    if let Err(err) = run_entrypoint().await {
+        eprintln!("runner failed: {err:?}");
+        process::exit(1);
+    }
+
+    info!("Runner completed successfully, exiting process");
+    process::exit(0);
+}
+
+async fn run_entrypoint() -> Result<()> {
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    let args = if raw_args.is_empty() {
+        parse_args(vec!["tests/sql/ducklake_basic.test".to_string()])?
+    } else {
+        parse_args(raw_args)?
+    };
+
+    info!(
+        "Running SQLLogicTest with {} script(s)",
+        args.test_files.len()
+    );
+    run_sqllogictest(&args).await
+}
+
+async fn run_sqllogictest(args: &CliArgs) -> Result<()> {
     for test_file in &args.test_files {
+        info!("Preparing script {}", test_file.display());
         let test_dir = resolve_test_dir(test_file)?;
         let mut substitutions = args.vars.clone();
         substitutions.insert("__TEST_DIR__".to_string(), test_dir.clone());
@@ -312,13 +378,28 @@ async fn run_sqllogictest() -> Result<()> {
         }
 
         let script = load_script_without_requires(test_file)?;
+        info!("Executing SQLLogicTest script {}", test_file.display());
 
         runner
             .run_script_with_name_async(&script, test_file.display().to_string())
             .await
             .with_context(|| format!("failed while running {}", test_file.display()))?;
+        info!("Script {} completed successfully", test_file.display());
         runner.shutdown_async().await;
+        info!("Runner shutdown complete for {}", test_file.display());
     }
 
+    info!("All SQLLogicTest scripts completed");
+
     Ok(())
+}
+
+fn init_logging() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_target(false)
+            .compact()
+            .try_init();
+    });
 }
