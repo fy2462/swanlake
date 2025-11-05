@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"strings"
 
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-adbc/go/adbc/driver/flightsql"
@@ -56,43 +55,26 @@ func main() {
 		log.Fatalf("Failed to create schema: %v", err)
 	}
 
-	// Transaction handled via Commit/Rollback
-
-	// Inserts with param binding (using prepared statements and Bind)
-	if err := insertPerson(ctx, conn, "Jason", "Moiron", "jmoiron@jmoiron.net"); err != nil {
-		conn.Rollback(ctx)
-		log.Fatalf("Failed to insert: %v", err)
+	// Batch inserts with param binding (using prepared statements and Bind)
+	peopleToInsert := []Person{
+		{FirstName: "Jason", LastName: "Moiron", Email: "jmoiron@jmoiron.net"},
+		{FirstName: "John", LastName: "Doe", Email: "johndoeDNE@gmail.net"},
+		{FirstName: "Jane", LastName: "Citizen", Email: "jane.citzen@example.com"},
 	}
-	if err := insertPerson(ctx, conn, "John", "Doe", "johndoeDNE@gmail.net"); err != nil {
+	if err := insertPeople(ctx, conn, peopleToInsert); err != nil {
 		conn.Rollback(ctx)
-		log.Fatalf("Failed to insert: %v", err)
-	}
-	if err := insertPlace(ctx, conn, "United States", sql.NullString{String: "New York", Valid: true}, 1); err != nil {
-		conn.Rollback(ctx)
-		log.Fatalf("Failed to insert: %v", err)
-	}
-	if err := insertPlace(ctx, conn, "Hong Kong", sql.NullString{Valid: false}, 852); err != nil {
-		conn.Rollback(ctx)
-		log.Fatalf("Failed to insert: %v", err)
-	}
-	if err := insertPlace(ctx, conn, "Singapore", sql.NullString{Valid: false}, 65); err != nil {
-		conn.Rollback(ctx)
-		log.Fatalf("Failed to insert: %v", err)
+		log.Fatalf("Failed to insert people: %v", err)
 	}
 
-	// Named insert with struct (simulate named binding)
-	jane := Person{FirstName: "Jane", LastName: "Citizen", Email: "jane.citzen@example.com"}
-	if err := insertPersonNamed(ctx, conn, jane); err != nil {
-		conn.Rollback(ctx)
-		log.Fatalf("Failed to insert: %v", err)
+	placesToInsert := []Place{
+		{Country: "United States", City: sql.NullString{String: "New York", Valid: true}, TelCode: 1},
+		{Country: "Hong Kong", City: sql.NullString{Valid: false}, TelCode: 852},
+		{Country: "Singapore", City: sql.NullString{Valid: false}, TelCode: 65},
 	}
-
-	// Commit
-	// if err := conn.Commit(ctx); err != nil {
-	// 	log.Fatalf("Failed to commit: %v", err)
-	// }
-
-	// Autocommit assumed default
+	if err := insertPlaces(ctx, conn, placesToInsert); err != nil {
+		conn.Rollback(ctx)
+		log.Fatalf("Failed to insert places: %v", err)
+	}
 
 	// Select all people
 	people, err := selectPeople(ctx, conn, "SELECT * FROM person ORDER BY first_name ASC")
@@ -133,52 +115,18 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	// Named insert (simulate :name)
-	if err := executeNamed(ctx, conn, "INSERT INTO person (first_name, last_name, email) VALUES (:first, :last, :email)",
-		map[string]interface{}{"first": "Bin", "last": "Smuth", "email": "bensmith@allblacks.nz"}); err != nil {
-		log.Fatalf("Failed to insert: %v", err)
-	}
-
-	// Named select
-	bins, err := selectPeopleNamed(ctx, conn, "SELECT * FROM person WHERE first_name = :fn", map[string]interface{}{"fn": "Bin"})
-	if err != nil {
-		log.Fatalf("Failed to query: %v", err)
-	}
-	if len(bins) > 0 {
-		fmt.Printf("Found: %#v\n", bins[0])
-	}
-
-	// Named select with struct
-	jasons, err := selectPeopleNamed(ctx, conn, "SELECT * FROM person WHERE first_name = :first_name", jason)
-	if err != nil {
-		log.Fatalf("Failed to query: %v", err)
-	}
-	if len(jasons) > 0 {
-		fmt.Printf("Found Jason: %#v\n", jasons[0])
-	}
-
-	// Batch insert with structs (simulate named)
-	personStructs := []Person{
+	// Additional batch insert
+	additionalPeople := []Person{
+		{FirstName: "Bin", LastName: "Smuth", Email: "bensmith@allblacks.nz"},
 		{FirstName: "Ardie", LastName: "Savea", Email: "asavea@ab.co.nz"},
 		{FirstName: "Sonny Bill", LastName: "Williams", Email: "sbw@ab.co.nz"},
 		{FirstName: "Ngani", LastName: "Laumape", Email: "nlaumape@ab.co.nz"},
+		{FirstName: "Ardie2", LastName: "Savea2", Email: "asavea2@ab.co.nz"},
+		{FirstName: "Sonny Bill2", LastName: "Williams2", Email: "sbw2@ab.co.nz"},
+		{FirstName: "Ngani2", LastName: "Laumape2", Email: "nlaumape2@ab.co.nz"},
 	}
-	for _, p := range personStructs {
-		if err := insertPersonNamed(ctx, conn, p); err != nil {
-			log.Fatalf("Failed to insert: %v", err)
-		}
-	}
-
-	// Batch insert with maps
-	personMaps := []map[string]interface{}{
-		{"first_name": "Ardie2", "last_name": "Savea2", "email": "asavea2@ab.co.nz"},
-		{"first_name": "Sonny Bill2", "last_name": "Williams2", "email": "sbw2@ab.co.nz"},
-		{"first_name": "Ngani2", "last_name": "Laumape2", "email": "nlaumape2@ab.co.nz"},
-	}
-	for _, m := range personMaps {
-		if err := executeNamed(ctx, conn, "INSERT INTO person (first_name, last_name, email) VALUES (:first_name, :last_name, :email)", m); err != nil {
-			log.Fatalf("Failed to insert: %v", err)
-		}
+	if err := insertPeople(ctx, conn, additionalPeople); err != nil {
+		log.Fatalf("Failed to insert additional people: %v", err)
 	}
 
 	fmt.Println("\n✅ All operations completed successfully!")
@@ -225,7 +173,10 @@ func executeStatement(ctx context.Context, conn adbc.Connection, sql string) err
 	return err
 }
 
-func insertPerson(ctx context.Context, conn adbc.Connection, first, last, email string) error {
+func insertPeople(ctx context.Context, conn adbc.Connection, people []Person) error {
+	if len(people) == 0 {
+		return nil
+	}
 	stmt, err := conn.NewStatement()
 	if err != nil {
 		return err
@@ -240,7 +191,7 @@ func insertPerson(ctx context.Context, conn adbc.Connection, first, last, email 
 		return err
 	}
 
-	// Create Arrow record for binding
+	// Create Arrow record for binding multiple rows
 	mem := memory.DefaultAllocator
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "first_name", Type: arrow.BinaryTypes.String},
@@ -250,9 +201,11 @@ func insertPerson(ctx context.Context, conn adbc.Connection, first, last, email 
 	builder := array.NewRecordBuilder(mem, schema)
 	defer builder.Release()
 
-	builder.Field(0).(*array.StringBuilder).AppendString(first)
-	builder.Field(1).(*array.StringBuilder).AppendString(last)
-	builder.Field(2).(*array.StringBuilder).AppendString(email)
+	for _, p := range people {
+		builder.Field(0).(*array.StringBuilder).AppendString(p.FirstName)
+		builder.Field(1).(*array.StringBuilder).AppendString(p.LastName)
+		builder.Field(2).(*array.StringBuilder).AppendString(p.Email)
+	}
 
 	record := builder.NewRecord()
 	defer record.Release()
@@ -265,17 +218,18 @@ func insertPerson(ctx context.Context, conn adbc.Connection, first, last, email 
 	return err
 }
 
-func insertPlace(ctx context.Context, conn adbc.Connection, country string, city sql.NullString, telcode int) error {
+func insertPlaces(ctx context.Context, conn adbc.Connection, places []Place) error {
+	if len(places) == 0 {
+		return nil
+	}
 	stmt, err := conn.NewStatement()
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
-	sql := "INSERT INTO place (country, telcode) VALUES (?, ?)"
-	if city.Valid {
-		sql = "INSERT INTO place (country, city, telcode) VALUES (?, ?, ?)"
-	}
+	// Always include city column as nullable
+	sql := "INSERT INTO place (country, city, telcode) VALUES (?, ?, ?)"
 	if err := stmt.SetSqlQuery(sql); err != nil {
 		return err
 	}
@@ -285,25 +239,23 @@ func insertPlace(ctx context.Context, conn adbc.Connection, country string, city
 	}
 
 	mem := memory.DefaultAllocator
-	fields := []arrow.Field{
+	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "country", Type: arrow.BinaryTypes.String},
-	}
-	if city.Valid {
-		fields = append(fields, arrow.Field{Name: "city", Type: arrow.BinaryTypes.String})
-	}
-	fields = append(fields, arrow.Field{Name: "telcode", Type: arrow.PrimitiveTypes.Int64})
-
-	schema := arrow.NewSchema(fields, nil)
+		{Name: "city", Type: &arrow.StringType{}, Nullable: true},
+		{Name: "telcode", Type: arrow.PrimitiveTypes.Int64},
+	}, nil)
 	builder := array.NewRecordBuilder(mem, schema)
 	defer builder.Release()
 
-	builder.Field(0).(*array.StringBuilder).AppendString(country)
-	idx := 1
-	if city.Valid {
-		builder.Field(idx).(*array.StringBuilder).AppendString(city.String)
-		idx++
+	for _, p := range places {
+		builder.Field(0).(*array.StringBuilder).AppendString(p.Country)
+		if p.City.Valid {
+			builder.Field(1).(*array.StringBuilder).AppendString(p.City.String)
+		} else {
+			builder.Field(1).(*array.StringBuilder).AppendNull()
+		}
+		builder.Field(2).(*array.Int64Builder).Append(int64(p.TelCode))
 	}
-	builder.Field(idx).(*array.Int64Builder).Append(int64(telcode))
 
 	record := builder.NewRecord()
 	defer record.Release()
@@ -314,26 +266,6 @@ func insertPlace(ctx context.Context, conn adbc.Connection, country string, city
 
 	_, err = stmt.ExecuteUpdate(ctx)
 	return err
-}
-
-func insertPersonNamed(ctx context.Context, conn adbc.Connection, p Person) error {
-	return executeNamed(ctx, conn, "INSERT INTO person (first_name, last_name, email) VALUES (:first_name, :last_name, :email)", p)
-}
-
-func executeNamed(ctx context.Context, conn adbc.Connection, sql string, params interface{}) error {
-	// Simulate named binding by replacing :name with values
-	replacedSQL := sql
-	switch p := params.(type) {
-	case map[string]interface{}:
-		for k, v := range p {
-			replacedSQL = strings.ReplaceAll(replacedSQL, ":"+k, fmt.Sprintf("'%v'", v))
-		}
-	case Person:
-		replacedSQL = strings.ReplaceAll(replacedSQL, ":first_name", fmt.Sprintf("'%s'", p.FirstName))
-		replacedSQL = strings.ReplaceAll(replacedSQL, ":last_name", fmt.Sprintf("'%s'", p.LastName))
-		replacedSQL = strings.ReplaceAll(replacedSQL, ":email", fmt.Sprintf("'%s'", p.Email))
-	}
-	return executeStatement(ctx, conn, replacedSQL)
 }
 
 func selectPeople(ctx context.Context, conn adbc.Connection, sql string, params ...interface{}) ([]Person, error) {
@@ -380,22 +312,6 @@ func selectPeople(ctx context.Context, conn adbc.Connection, sql string, params 
 	defer reader.Release()
 
 	return scanPeople(reader)
-}
-
-func selectPeopleNamed(ctx context.Context, conn adbc.Connection, sql string, params interface{}) ([]Person, error) {
-	var paramList []interface{}
-	replacedSQL := sql
-	switch p := params.(type) {
-	case map[string]interface{}:
-		for k, v := range p {
-			replacedSQL = strings.ReplaceAll(replacedSQL, ":"+k, "?")
-			paramList = append(paramList, v)
-		}
-	case Person:
-		replacedSQL = strings.ReplaceAll(replacedSQL, ":first_name", "?")
-		paramList = append(paramList, p.FirstName)
-	}
-	return selectPeople(ctx, conn, replacedSQL, paramList...)
 }
 
 func selectPlaces(ctx context.Context, conn adbc.Connection, sql string) ([]Place, error) {

@@ -10,15 +10,13 @@ import (
 )
 
 var schema = `
-ATTACH OR REPLACE 'ducklake:postgres:dbname=ducklake-test' AS swandb (DATA_PATH 'r2://ducklake-test/');
-
-CREATE TABLE person (
+CREATE TABLE IF NOT EXISTS person (
     first_name VARCHAR,
     last_name VARCHAR,
     email VARCHAR
 );
 
-CREATE TABLE place (
+CREATE TABLE IF NOT EXISTS place (
     country VARCHAR,
     city VARCHAR NULL,
     telcode INTEGER
@@ -55,7 +53,8 @@ func main() {
 	tx.MustExec("INSERT INTO place (country, telcode) VALUES ($1, $2)", "Hong Kong", "852")
 	tx.MustExec("INSERT INTO place (country, telcode) VALUES ($1, $2)", "Singapore", "65")
 	// Named queries can use structs, so if you have an existing struct (i.e. person := &Person{}) that you have populated, you can pass it in as &person
-	tx.NamedExec("INSERT INTO person (first_name, last_name, email) VALUES (:first_name, :last_name, :email)", &Person{"Jane", "Citizen", "jane.citzen@example.com"})
+	// TODO
+	tx.NamedExec("INSERT INTO person (first_name, last_name, email) VALUES ($first_name, $last_name, $email)", &Person{"Jane", "Citizen", "jane.citzen@example.com"})
 	tx.Commit()
 
 	// Query the database, storing results in a []Person (wrapped in []interface{})
@@ -63,14 +62,14 @@ func main() {
 	db.Select(&people, "SELECT * FROM person ORDER BY first_name ASC")
 	jason, john := people[0], people[1]
 
-	fmt.Printf("%#v\n%#v", jason, john)
+	fmt.Printf("%#v\n%#v\n", jason, john)
 	// Person{FirstName:"Jason", LastName:"Moiron", Email:"jmoiron@jmoiron.net"}
 	// Person{FirstName:"John", LastName:"Doe", Email:"johndoeDNE@gmail.net"}
 
 	// You can also get a single result, a la QueryRow
 	jason = Person{}
-	err = db.Get(&jason, "SELECT * FROM person WHERE first_name=$1", "Jason")
-	fmt.Printf("%#v\n", jason)
+	err = db.Get(&jason, "SELECT * FROM person WHERE first_name = ?", "Jason")
+	fmt.Printf("1234 %#v\n", jason)
 	// Person{FirstName:"Jason", LastName:"Moiron", Email:"jmoiron@jmoiron.net"}
 
 	// if you have null fields and use SELECT *, you must use sql.Null* in your struct

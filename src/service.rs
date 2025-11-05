@@ -989,6 +989,8 @@ impl FlightSqlService for SwanFlightSqlService {
         let transaction_id = query.transaction_id.to_vec();
         tracing::Span::current().record("transaction_id", format!("{:?}", transaction_id).as_str());
 
+        // definition of action enum:
+        // https://arrow.apache.org/dotnet/current/api/Arrow.Flight.Protocol.Sql.ActionEndTransactionRequest.Types.EndTransaction.html
         let action = query.action;
 
         // Commit or rollback transaction on session's connection
@@ -996,7 +998,7 @@ impl FlightSqlService for SwanFlightSqlService {
         let txn_id_clone = transaction_id.clone();
 
         let commit_result = tokio::task::spawn_blocking(move || {
-            if action == 0 {
+            if action == 1 {
                 session_clone.commit_transaction(&txn_id_clone)
             } else {
                 session_clone.rollback_transaction(&txn_id_clone)
@@ -1011,7 +1013,7 @@ impl FlightSqlService for SwanFlightSqlService {
                 // all good
             }
             Err(status) => {
-                if action == 0
+                if action == 1
                     && status
                         .message()
                         .contains("Cannot commit when autocommit is enabled")
@@ -1020,7 +1022,7 @@ impl FlightSqlService for SwanFlightSqlService {
                         transaction_id = ?transaction_id,
                         "commit requested while autocommit enabled; treated as no-op"
                     );
-                } else if action != 0
+                } else if action != 1
                     && status
                         .message()
                         .contains("cannot rollback when autocommit is enabled")
@@ -1035,7 +1037,7 @@ impl FlightSqlService for SwanFlightSqlService {
             }
         }
 
-        let op = if action == 0 {
+        let op = if action == 1 {
             "committed"
         } else {
             "rolled back"
