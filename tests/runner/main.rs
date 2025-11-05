@@ -192,6 +192,7 @@ struct CliArgs {
     test_files: Vec<PathBuf>,
     labels: Vec<String>,
     vars: HashMap<String, String>,
+    test_dir: Option<String>,
 }
 
 fn parse_args<I: IntoIterator<Item = String>>(args_iter: I) -> Result<CliArgs> {
@@ -200,6 +201,7 @@ fn parse_args<I: IntoIterator<Item = String>>(args_iter: I) -> Result<CliArgs> {
     let mut labels = Vec::new();
     let mut vars = HashMap::new();
     let mut test_files = Vec::new();
+    let mut test_dir: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -216,6 +218,10 @@ fn parse_args<I: IntoIterator<Item = String>>(args_iter: I) -> Result<CliArgs> {
                     .split_once('=')
                     .ok_or_else(|| anyhow!("--var expects KEY=VALUE, got {raw}"))?;
                 vars.insert(format!("__{key}__"), value.to_string());
+            }
+            "--test-dir" => {
+                let dir = args.next().context("expected value after --test-dir")?;
+                test_dir = Some(dir);
             }
             "--help" | "-h" => {
                 bail!("help requested");
@@ -236,21 +242,8 @@ fn parse_args<I: IntoIterator<Item = String>>(args_iter: I) -> Result<CliArgs> {
         test_files,
         labels,
         vars,
+        test_dir,
     })
-}
-
-fn resolve_test_dir(path: &Path) -> Result<String> {
-    let dir = path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-    let canonical = dir
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", dir.display()))?;
-    canonical
-        .to_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("test directory contains invalid UTF-8"))
 }
 
 fn load_script_without_requires(path: &Path) -> Result<String> {
@@ -332,11 +325,11 @@ async fn main() {
 
 async fn run_entrypoint() -> Result<()> {
     let raw_args: Vec<String> = env::args().skip(1).collect();
-    let args = if raw_args.is_empty() {
-        parse_args(vec!["tests/sql/ducklake_basic.test".to_string()])?
-    } else {
-        parse_args(raw_args)?
-    };
+    let args = parse_args(raw_args)?;
+
+    if args.test_dir.is_none() {
+        bail!("--test-dir is required");
+    }
 
     info!(
         "Running SQLLogicTest with {} script(s)",
@@ -348,7 +341,7 @@ async fn run_entrypoint() -> Result<()> {
 async fn run_sqllogictest(args: &CliArgs) -> Result<()> {
     for test_file in &args.test_files {
         info!("Preparing script {}", test_file.display());
-        let test_dir = resolve_test_dir(test_file)?;
+        let test_dir = args.test_dir.as_ref().unwrap().clone();
         let mut substitutions = args.vars.clone();
         substitutions.insert("__TEST_DIR__".to_string(), test_dir.clone());
 

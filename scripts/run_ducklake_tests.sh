@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENDPOINT="${ENDPOINT:-http://127.0.0.1:4214}"
+ENDPOINT="${ENDPOINT:-grpc://127.0.0.1:4214}"
 TEST_FILE="${TEST_FILE:-$ROOT_DIR/tests/sql/ducklake_basic.test}"
 CONFIG_FILE="${CONFIG_FILE:-$ROOT_DIR/config.toml}"
 SERVER_BIN="${SERVER_BIN:-cargo run --bin swanlake --}"
@@ -60,7 +60,12 @@ print(f"Timed out waiting for Flight SQL server at {host}:{port}", file=sys.stde
 sys.exit(1)
 PY
 
-cargo run --features test-runner --bin run_sqllogictest -- "$TEST_FILE" --endpoint "$ENDPOINT"
+if [[ -n "${TEST_DIR:-}" ]]; then
+  ARGS=(--test-dir "$TEST_DIR")
+else
+  ARGS=()
+fi
+cargo test --features test-runner --test runner -- "$TEST_FILE" --endpoint "$ENDPOINT" "${ARGS[@]}"
 
 cleanup
 trap - EXIT
