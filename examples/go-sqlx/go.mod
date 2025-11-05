@@ -7,7 +7,7 @@ require (
 	github.com/jmoiron/sqlx v1.4.0
 )
 
-replace github.com/apache/arrow-adbc/go/adbc => /Users/wangfenjin/github/arrow-adbc/go/adbc
+replace github.com/apache/arrow-adbc/go/adbc => github.com/swanlake-io/arrow-adbc/go/adbc v0.0.0-20251105023343-1653a3d9cb86
 
 require (
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
