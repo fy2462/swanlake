@@ -46,6 +46,63 @@ impl AsRef<str> for SessionId {
     }
 }
 
+macro_rules! define_id_type {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub struct $name(u64);
+
+        impl $name {
+            /// Number of bytes required to encode this ID
+            pub const BYTE_LEN: usize = std::mem::size_of::<u64>();
+
+            /// Create a new ID from a u64 value
+            pub fn new(id: u64) -> Self {
+                Self(id)
+            }
+
+            /// Get the underlying u64 ID
+            pub fn id(&self) -> u64 {
+                self.0
+            }
+
+            /// Convert to big-endian bytes
+            pub fn to_bytes(self) -> Vec<u8> {
+                self.0.to_be_bytes().to_vec()
+            }
+
+            /// Create from big-endian bytes
+            pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+                Some(Self(u64::from_be_bytes(bytes.try_into().ok()?)))
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+
+        impl From<$name> for Vec<u8> {
+            fn from(id: $name) -> Vec<u8> {
+                id.to_bytes()
+            }
+        }
+
+        impl From<$name> for prost::bytes::Bytes {
+            fn from(id: $name) -> prost::bytes::Bytes {
+                id.to_bytes().into()
+            }
+        }
+    };
+}
+
+define_id_type!(
+    StatementHandle,
+    "Prepared statement handle - wraps a u64 ID"
+);
+define_id_type!(TransactionId, "Transaction ID - wraps a u64 ID");
+
 /// Transaction ID generator
 #[derive(Debug)]
 pub struct TransactionIdGenerator {
@@ -59,9 +116,9 @@ impl TransactionIdGenerator {
         }
     }
 
-    pub fn next(&self) -> Vec<u8> {
+    pub fn next(&self) -> TransactionId {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        id.to_be_bytes().to_vec()
+        TransactionId::new(id)
     }
 }
 
@@ -84,9 +141,9 @@ impl StatementHandleGenerator {
         }
     }
 
-    pub fn next(&self) -> Vec<u8> {
+    pub fn next(&self) -> StatementHandle {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        id.to_be_bytes().to_vec()
+        StatementHandle::new(id)
     }
 }
 

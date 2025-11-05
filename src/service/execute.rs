@@ -6,6 +6,7 @@ use tonic::{metadata::MetadataValue, Response, Status};
 use tracing::{debug, error, info};
 
 use crate::engine::connection::QueryResult;
+use crate::session::id::StatementHandle;
 use crate::session::session::{PreparedStatementMeta, Session};
 
 use super::SwanFlightSqlService;
@@ -32,7 +33,7 @@ impl SwanFlightSqlService {
     pub(crate) async fn execute_prepared_query_handle(
         &self,
         session: &Arc<Session>,
-        handle: &[u8],
+        handle: StatementHandle,
         meta: PreparedStatementMeta,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let parameters = session
@@ -41,7 +42,7 @@ impl SwanFlightSqlService {
             .unwrap_or_else(Vec::new);
 
         info!(
-            handle = ?handle,
+            handle = %handle,
             sql = %meta.sql,
             param_count = parameters.len(),
             "executing prepared statement via handle"
@@ -76,7 +77,7 @@ impl SwanFlightSqlService {
             })?;
 
         debug!(
-            handle,
+            handle = %handle,
             batch_count = flight_data.len(),
             "converted batches to flight data"
         );
@@ -92,7 +93,7 @@ impl SwanFlightSqlService {
                 .insert("x-swandb-total-bytes", value);
         }
         info!(
-            handle = ?handle,
+            handle = %handle,
             total_rows, total_bytes, "prepared statement completed"
         );
         Ok(response)

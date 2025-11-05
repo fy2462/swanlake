@@ -2,9 +2,10 @@ use arrow_flight::sql::{
     ActionBeginTransactionRequest, ActionBeginTransactionResult, ActionEndTransactionRequest,
 };
 use tonic::{Request, Status};
-use tracing::info;
+use tracing::{error, field::display, info};
 
 use crate::service::SwanFlightSqlService;
+use crate::session::id::TransactionId;
 
 pub(crate) async fn do_action_begin_transaction(
     service: &SwanFlightSqlService,
@@ -19,7 +20,7 @@ pub(crate) async fn do_action_begin_transaction(
         .map_err(SwanFlightSqlService::status_from_join)?
         .map_err(SwanFlightSqlService::status_from_error)?;
 
-    info!(transaction_id = ?transaction_id, "transaction started in session");
+    info!(transaction_id = %transaction_id, "transaction started in session");
 
     Ok(ActionBeginTransactionResult {
         transaction_id: transaction_id.into(),
@@ -33,19 +34,28 @@ pub(crate) async fn do_action_end_transaction(
 ) -> Result<(), Status> {
     let session = service.prepare_request(&request)?;
 
-    let transaction_id = query.transaction_id.to_vec();
-    tracing::Span::current().record("transaction_id", format!("{:?}", transaction_id).as_str());
+    let transaction_id = match TransactionId::from_bytes(&query.transaction_id) {
+        Some(id) => id,
+        None => {
+            error!(
+                handle_len = query.transaction_id.len(),
+                "invalid transaction ID received from client"
+            );
+            return Err(Status::invalid_argument("invalid transaction ID"));
+        }
+    };
+    tracing::Span::current().record("transaction_id", display(transaction_id));
 
     let action = query.action;
 
     let session_clone = session.clone();
-    let txn_id_clone = transaction_id.clone();
+    let txn_id_clone = transaction_id;
 
     let commit_result = tokio::task::spawn_blocking(move || {
         if action == 1 {
-            session_clone.commit_transaction(&txn_id_clone)
+            session_clone.commit_transaction(txn_id_clone)
         } else {
-            session_clone.rollback_transaction(&txn_id_clone)
+            session_clone.rollback_transaction(txn_id_clone)
         }
     })
     .await
@@ -61,7 +71,7 @@ pub(crate) async fn do_action_end_transaction(
                     .contains("Cannot commit when autocommit is enabled")
             {
                 info!(
-                    transaction_id = ?transaction_id,
+                    transaction_id = %transaction_id,
                     "commit requested while autocommit enabled; treated as no-op"
                 );
             } else if action != 1
@@ -70,7 +80,7 @@ pub(crate) async fn do_action_end_transaction(
                     .contains("cannot rollback when autocommit is enabled")
             {
                 info!(
-                    transaction_id = ?transaction_id,
+                    transaction_id = %transaction_id,
                     "rollback requested while autocommit enabled; treated as no-op"
                 );
             } else {
@@ -84,7 +94,7 @@ pub(crate) async fn do_action_end_transaction(
     } else {
         "rolled back"
     };
-    info!(transaction_id = ?transaction_id, op, "transaction completed in session");
+    info!(transaction_id = %transaction_id, op, "transaction completed in session");
 
     Ok(())
 }

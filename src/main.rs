@@ -16,9 +16,9 @@ mod session;
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
-    init_tracing();
 
     let config = ServerConfig::load().context("failed to load configuration")?;
+    init_tracing(&config);
     info!("service config:\n{:?}", config);
     let addr = config
         .bind_addr()
@@ -54,15 +54,29 @@ async fn main() -> Result<()> {
         .context("Flight SQL server terminated unexpectedly")
 }
 
-fn init_tracing() {
+fn init_tracing(config: &ServerConfig) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,swandb::service=debug"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_file(true)
-        .with_line_number(true)
-        .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
-        .compact()
-        .init();
+
+    if config.log_format == "json" {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_file(true)
+            .with_line_number(true)
+            .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
+            .with_ansi(config.log_ansi)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .compact()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_file(true)
+            .with_line_number(true)
+            .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
+            .with_ansi(config.log_ansi)
+            .init();
+    }
 }

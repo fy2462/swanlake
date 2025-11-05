@@ -52,6 +52,8 @@ The server listens on `127.0.0.1:4214` by default and can be configured through 
 | `SWANDB_SESSION_TIMEOUT_SECONDS` | Idle session timeout in seconds | `1800` |
 | `SWANDB_ENABLE_DUCKLAKE` | Toggle automatic `ducklake` extension install/load | `true` |
 | `SWANDB_DUCKLAKE_INIT_SQL` | Optional SQL executed after the extension loads (e.g. ATTACH commands) | _unset_ |
+| `SWANDB_LOG_FORMAT` | Log output format: "compact" or "json" | `compact` |
+| `SWANDB_LOG_ANSI` | Enable ANSI colors in logs | `true` |
 
 `.env` files are loaded automatically via `dotenvy`. You can also point the binary at a custom `config.toml` with `--config`; environment variables always take precedence.
 

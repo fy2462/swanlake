@@ -26,6 +26,10 @@ pub struct ServerConfig {
     pub max_sessions: Option<usize>,
     /// Session idle timeout in seconds.
     pub session_timeout_seconds: Option<u64>,
+    /// Log format: "compact" or "json".
+    pub log_format: String,
+    /// Whether to enable ANSI colors in logs.
+    pub log_ansi: bool,
 }
 
 impl Default for ServerConfig {
@@ -42,6 +46,8 @@ impl Default for ServerConfig {
             enable_ui_server: true,
             max_sessions: Some(100),
             session_timeout_seconds: Some(900),
+            log_format: "compact".to_string(),
+            log_ansi: true,
         }
     }
 }

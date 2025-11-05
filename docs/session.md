@@ -101,30 +101,34 @@ pub struct Session {
 Stored in session-scoped HashMap:
 
 ```rust
-prepared_statements: Arc<Mutex<HashMap<Vec<u8>, PreparedStatementState>>>
+prepared_statements: Arc<Mutex<HashMap<StatementHandle, PreparedStatementState>>>
 ```
 
 **Workflow:**
 ```
-Request 1: CreatePreparedStatement → handle = [1,0,0,0,0,0,0,0]
+Request 1: CreatePreparedStatement → handle = StatementHandle::new(1)
 Request 2: BindParameters(handle)  → Same session, finds statement ✅
 Request 3: Execute(handle)         → Same session, executes ✅
 ```
+
+Handles are lightweight wrappers around `u64` values; they serialize to big-endian bytes when crossing the Flight wire format.
 
 ### 3. Transactions
 
 Tracked per session:
 
 ```rust
-transactions: Arc<Mutex<HashMap<Vec<u8>, Transaction>>>
+transactions: Arc<Mutex<HashMap<TransactionId, Transaction>>>
 ```
 
 **Workflow:**
 ```
-Request 1: BeginTransaction     → txn_id = [1,0,0,0,0,0,0,0]
+Request 1: BeginTransaction     → txn_id = TransactionId::new(1)
 Request 2: Execute in txn       → Same session, same transaction ✅
 Request 3: Commit(txn_id)       → Same session, commits ✅
 ```
+
+`TransactionId` follows the same wrapping/serialization approach as `StatementHandle`, keeping logs readable while maintaining a compact protocol payload.
 
 ### 4. Activity Tracking
 
@@ -230,16 +234,16 @@ Sessions are removed if `idle_duration() > session_timeout`.
 pub struct Session {
     id: SessionId,
     connection: DuckDbConnection,
-    transactions: Arc<Mutex<HashMap<Vec<u8>, Transaction>>>,
-    prepared_statements: Arc<Mutex<HashMap<Vec<u8>, PreparedStatementState>>>,
+    transactions: Arc<Mutex<HashMap<TransactionId, Transaction>>>,
+    prepared_statements: Arc<Mutex<HashMap<StatementHandle, PreparedStatementState>>>,
     last_activity: Arc<Mutex<Instant>>,
     writes_enabled: bool,
 }
 
 impl Session {
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult, ServerError>;
-    pub fn begin_transaction(&self) -> Result<Vec<u8>, ServerError>;
-    pub fn create_prepared_statement(&self, sql: String, is_query: bool, transaction_id: Option<Vec<u8>>) -> Result<Vec<u8>, ServerError>;
+    pub fn begin_transaction(&self) -> Result<TransactionId, ServerError>;
+    pub fn create_prepared_statement(&self, sql: String, is_query: bool) -> Result<StatementHandle, ServerError>;
     // ...
 }
 ```

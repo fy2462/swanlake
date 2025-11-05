@@ -14,7 +14,9 @@ use tracing::{debug, instrument};
 
 use crate::engine::{DuckDbConnection, QueryResult};
 use crate::error::ServerError;
-use crate::session::id::{SessionId, StatementHandleGenerator, TransactionIdGenerator};
+use crate::session::id::{
+    SessionId, StatementHandle, StatementHandleGenerator, TransactionId, TransactionIdGenerator,
+};
 
 /// Metadata for a prepared statement
 #[derive(Debug, Clone)]
@@ -42,13 +44,13 @@ impl PreparedStatementState {
 /// Transaction state
 #[derive(Debug)]
 struct Transaction {
-    _id: Vec<u8>,
+    _id: TransactionId,
     _started_at: Instant,
     // Future: add transaction-specific state
 }
 
 impl Transaction {
-    fn new(id: Vec<u8>) -> Self {
+    fn new(id: TransactionId) -> Self {
         Self {
             _id: id,
             _started_at: Instant::now(),
@@ -60,8 +62,8 @@ impl Transaction {
 pub struct Session {
     id: SessionId,
     connection: DuckDbConnection,
-    transactions: Arc<Mutex<HashMap<Vec<u8>, Transaction>>>,
-    prepared_statements: Arc<Mutex<HashMap<Vec<u8>, PreparedStatementState>>>,
+    transactions: Arc<Mutex<HashMap<TransactionId, Transaction>>>,
+    prepared_statements: Arc<Mutex<HashMap<StatementHandle, PreparedStatementState>>>,
     transaction_id_gen: Arc<TransactionIdGenerator>,
     statement_handle_gen: Arc<StatementHandleGenerator>,
     last_activity: Arc<Mutex<Instant>>,
@@ -161,7 +163,7 @@ impl Session {
         &self,
         sql: String,
         is_query: bool,
-    ) -> Result<Vec<u8>, ServerError> {
+    ) -> Result<StatementHandle, ServerError> {
         self.touch();
 
         let handle = self.statement_handle_gen.next();
@@ -171,23 +173,23 @@ impl Session {
             .prepared_statements
             .lock()
             .expect("prepared_statements mutex poisoned");
-        prepared.insert(handle.clone(), PreparedStatementState::new(meta));
+        prepared.insert(handle, PreparedStatementState::new(meta));
 
-        debug!(handle = ?handle, "created prepared statement");
+        debug!(handle = %handle, "created prepared statement");
         Ok(handle)
     }
 
     /// Get prepared statement metadata
     pub fn get_prepared_statement_meta(
         &self,
-        handle: &[u8],
+        handle: StatementHandle,
     ) -> Result<PreparedStatementMeta, ServerError> {
         let prepared = self
             .prepared_statements
             .lock()
             .expect("prepared_statements mutex poisoned");
         prepared
-            .get(handle)
+            .get(&handle)
             .map(|state| state.meta.clone())
             .ok_or(ServerError::PreparedStatementNotFound)
     }
@@ -195,7 +197,7 @@ impl Session {
     /// Set parameters for a prepared statement
     pub fn set_prepared_statement_parameters(
         &self,
-        handle: &[u8],
+        handle: StatementHandle,
         params: Vec<Value>,
     ) -> Result<(), ServerError> {
         let mut prepared = self
@@ -203,7 +205,7 @@ impl Session {
             .lock()
             .expect("prepared_statements mutex poisoned");
         let state = prepared
-            .get_mut(handle)
+            .get_mut(&handle)
             .ok_or(ServerError::PreparedStatementNotFound)?;
         state.pending_parameters = Some(params);
         Ok(())
@@ -212,28 +214,28 @@ impl Session {
     /// Take (consume) parameters from a prepared statement
     pub fn take_prepared_statement_parameters(
         &self,
-        handle: &[u8],
+        handle: StatementHandle,
     ) -> Result<Option<Vec<Value>>, ServerError> {
         let mut prepared = self
             .prepared_statements
             .lock()
             .expect("prepared_statements mutex poisoned");
         let state = prepared
-            .get_mut(handle)
+            .get_mut(&handle)
             .ok_or(ServerError::PreparedStatementNotFound)?;
         Ok(state.pending_parameters.take())
     }
 
     /// Close a prepared statement
-    pub fn close_prepared_statement(&self, handle: &[u8]) -> Result<(), ServerError> {
+    pub fn close_prepared_statement(&self, handle: StatementHandle) -> Result<(), ServerError> {
         let mut prepared = self
             .prepared_statements
             .lock()
             .expect("prepared_statements mutex poisoned");
         prepared
-            .remove(handle)
+            .remove(&handle)
             .ok_or(ServerError::PreparedStatementNotFound)?;
-        debug!(handle = ?handle, "closed prepared statement");
+        debug!(handle = %handle, "closed prepared statement");
         Ok(())
     }
 
@@ -241,7 +243,7 @@ impl Session {
 
     /// Begin a new transaction
     #[instrument(skip(self), fields(session_id = %self.id))]
-    pub fn begin_transaction(&self) -> Result<Vec<u8>, ServerError> {
+    pub fn begin_transaction(&self) -> Result<TransactionId, ServerError> {
         if !self.writes_enabled {
             return Err(ServerError::WritesDisabled);
         }
@@ -255,15 +257,15 @@ impl Session {
             .transactions
             .lock()
             .expect("transactions mutex poisoned");
-        transactions.insert(tx_id.clone(), Transaction::new(tx_id.clone()));
+        transactions.insert(tx_id, Transaction::new(tx_id));
 
-        debug!(transaction_id = ?tx_id, "began transaction");
+        debug!(transaction_id = %tx_id, "began transaction");
         Ok(tx_id)
     }
 
     /// Commit a transaction
-    #[instrument(skip(self), fields(session_id = %self.id, transaction_id = ?transaction_id))]
-    pub fn commit_transaction(&self, transaction_id: &[u8]) -> Result<(), ServerError> {
+    #[instrument(skip(self), fields(session_id = %self.id, transaction_id = %transaction_id))]
+    pub fn commit_transaction(&self, transaction_id: TransactionId) -> Result<(), ServerError> {
         if !self.writes_enabled {
             return Err(ServerError::WritesDisabled);
         }
@@ -274,21 +276,21 @@ impl Session {
             .transactions
             .lock()
             .expect("transactions mutex poisoned");
-        if !transactions.contains_key(transaction_id) {
+        if !transactions.contains_key(&transaction_id) {
             return Err(ServerError::TransactionNotFound);
         }
 
         // Execute COMMIT on the connection
         self.connection.execute_batch("COMMIT")?;
 
-        transactions.remove(transaction_id);
+        transactions.remove(&transaction_id);
         debug!("committed transaction");
         Ok(())
     }
 
     /// Rollback a transaction
-    #[instrument(skip(self), fields(session_id = %self.id, transaction_id = ?transaction_id))]
-    pub fn rollback_transaction(&self, transaction_id: &[u8]) -> Result<(), ServerError> {
+    #[instrument(skip(self), fields(session_id = %self.id, transaction_id = %transaction_id))]
+    pub fn rollback_transaction(&self, transaction_id: TransactionId) -> Result<(), ServerError> {
         if !self.writes_enabled {
             return Err(ServerError::WritesDisabled);
         }
@@ -299,14 +301,14 @@ impl Session {
             .transactions
             .lock()
             .expect("transactions mutex poisoned");
-        if !transactions.contains_key(transaction_id) {
+        if !transactions.contains_key(&transaction_id) {
             return Err(ServerError::TransactionNotFound);
         }
 
         // Execute ROLLBACK on the connection
         self.connection.execute_batch("ROLLBACK")?;
 
-        transactions.remove(transaction_id);
+        transactions.remove(&transaction_id);
         debug!("rolled back transaction");
         Ok(())
     }

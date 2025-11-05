@@ -122,18 +122,20 @@ let schema = arrow.get_schema();
 
 ### Current Implementation
 
-**Handle Format:** SQL text encoded as UTF-8 bytes
+**Handle Format:** `StatementHandle` type wrapping a u64 ID, convertible to/from big-endian bytes
 
 **Flow:**
-1. `CreatePreparedStatement` → Returns handle (SQL text) + schema (via LIMIT 0)
+1. `CreatePreparedStatement` → Returns `StatementHandle` + schema (via LIMIT 0)
 2. `GetFlightInfo` → Returns schema + ticket (total_records = -1)
 3. `DoGet` → Decodes handle, re-prepares, executes, streams results
 
-**Why Session-Scoped?**
-- ✅ Better isolation between clients
-- ✅ Natural cleanup when sessions end
+**Trade-offs:**
 - ✅ Enables transaction state persistence
 - ✅ Simpler lifecycle management
+
+**Logging:** Handles are logged as readable u64 numbers via `StatementHandle`'s `Display` implementation.
+
+**Transaction IDs:** Similarly, `TransactionId` type wraps a u64 ID for transaction management, with the same conversion and logging benefits.
 
 **Future Improvement:** If DuckDB-rs adds `Statement::schema()`, we can remove LIMIT 0 optimization.
 

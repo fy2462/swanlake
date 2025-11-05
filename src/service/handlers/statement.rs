@@ -12,6 +12,7 @@ use tracing::{debug, error, info};
 
 use crate::engine::connection::QueryResult;
 use crate::service::SwanFlightSqlService;
+use crate::session::id::StatementHandle;
 
 pub(crate) async fn get_flight_info_statement(
     service: &SwanFlightSqlService,
@@ -54,30 +55,44 @@ pub(crate) async fn do_get_statement(
     if let Ok(prepared_query) =
         CommandPreparedStatementQuery::decode(ticket.statement_handle.as_ref())
     {
-        let handle = &prepared_query.prepared_statement_handle;
-        let session = service.get_session(&request)?;
+        let handle_bytes = prepared_query.prepared_statement_handle.as_ref();
+        if let Some(handle) = StatementHandle::from_bytes(handle_bytes) {
+            let session = service.get_session(&request)?;
 
-        if let Ok(meta) = session.get_prepared_statement_meta(handle) {
-            if !meta.is_query {
-                return Err(Status::invalid_argument(
-                    "prepared statement does not return a result set",
-                ));
+            if let Ok(meta) = session.get_prepared_statement_meta(handle) {
+                if !meta.is_query {
+                    error!(
+                        handle = %handle,
+                        "prepared statement does not return a result set"
+                    );
+                    return Err(Status::invalid_argument(
+                        "prepared statement does not return a result set",
+                    ));
+                }
+
+                info!(
+                    handle = %handle,
+                    sql = %meta.sql,
+                    "executing prepared statement via do_get_statement"
+                );
+
+                return service
+                    .execute_prepared_query_handle(&session, handle, meta)
+                    .await;
             }
-
-            info!(
-                handle = ?handle,
-                sql = %meta.sql,
-                "executing prepared statement via do_get_statement"
+        } else {
+            debug!(
+                handle_len = handle_bytes.len(),
+                "statement handle payload did not decode to prepared handle; falling back to direct execution"
             );
-
-            return service
-                .execute_prepared_query_handle(&session, handle, meta)
-                .await;
         }
     }
 
-    let command = CommandStatementQuery::decode(ticket.statement_handle.as_ref())
-        .map_err(|err| Status::invalid_argument(format!("invalid statement handle: {err}")))?;
+    let command =
+        CommandStatementQuery::decode(ticket.statement_handle.as_ref()).map_err(|err| {
+            error!(%err, "failed to decode statement handle payload");
+            Status::invalid_argument(format!("invalid statement handle: {err}"))
+        })?;
     let sql = command.query.clone();
 
     info!(%sql, "executing query via do_get_statement");
