@@ -1,0 +1,16 @@
+[package]
+name = "rust-adbc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+adbc_core = "0.20.0"
+adbc_driver_flightsql = { package = "adbc-driver-flightsql", git = "https://github.com/swanlake-io/adbc-driver-flightsql" }
+adbc_driver_manager = "0.20.0"
+arrow-array = "56"
+arrow-cast = "56"
+arrow-schema = "56"
+anyhow = "1.0"
+tokio = { version = "1.38", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
