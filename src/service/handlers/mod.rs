@@ -23,7 +23,7 @@ mod transaction;
 impl FlightSqlService for SwanFlightSqlService {
     type FlightService = SwanFlightSqlService;
 
-    #[instrument(skip(self, request), fields(session_id, sql = %query.query))]
+    #[instrument(skip(self, request, query), fields(session_id, sql = %query.query))]
     async fn get_flight_info_statement(
         &self,
         query: CommandStatementQuery,
@@ -32,7 +32,7 @@ impl FlightSqlService for SwanFlightSqlService {
         statement::get_flight_info_statement(self, query, request).await
     }
 
-    #[instrument(skip(self, request), fields(session_id, sql))]
+    #[instrument(skip(self, request, ticket), fields(session_id))]
     async fn do_get_statement(
         &self,
         ticket: TicketStatementQuery,
@@ -63,7 +63,7 @@ impl FlightSqlService for SwanFlightSqlService {
         sql_info::do_get_sql_info(self, query, request).await
     }
 
-    #[instrument(skip(self, request), fields(session_id, sql = %command.query))]
+    #[instrument(skip(self, request, command), fields(session_id, sql = %command.query))]
     async fn do_put_statement_update(
         &self,
         command: CommandStatementUpdate,
@@ -72,7 +72,7 @@ impl FlightSqlService for SwanFlightSqlService {
         statement::do_put_statement_update(self, command, request).await
     }
 
-    #[instrument(skip(self, request), fields(session_id, sql = %query.query, is_query))]
+    #[instrument(skip(self, request, query), fields(session_id, sql = %query.query, is_query))]
     async fn do_action_create_prepared_statement(
         &self,
         query: ActionCreatePreparedStatementRequest,
@@ -81,7 +81,7 @@ impl FlightSqlService for SwanFlightSqlService {
         prepared::do_action_create_prepared_statement(self, query, request).await
     }
 
-    #[instrument(skip(self, request), fields(session_id, sql))]
+    #[instrument(skip(self, request, query), fields(session_id, sql))]
     async fn get_flight_info_prepared_statement(
         &self,
         query: CommandPreparedStatementQuery,
@@ -90,7 +90,7 @@ impl FlightSqlService for SwanFlightSqlService {
         prepared::get_flight_info_prepared_statement(self, query, request).await
     }
 
-    #[instrument(skip(self, request), fields(session_id, sql))]
+    #[instrument(skip(self, request, query), fields(session_id, sql))]
     async fn do_get_prepared_statement(
         &self,
         query: CommandPreparedStatementQuery,
@@ -99,7 +99,7 @@ impl FlightSqlService for SwanFlightSqlService {
         prepared::do_get_prepared_statement(self, query, request).await
     }
 
-    #[instrument(skip(self, request), fields(session_id, sql))]
+    #[instrument(skip(self, request, query), fields(session_id, sql))]
     async fn do_put_prepared_statement_query(
         &self,
         query: CommandPreparedStatementQuery,
@@ -108,7 +108,7 @@ impl FlightSqlService for SwanFlightSqlService {
         prepared::do_put_prepared_statement_query(self, query, request).await
     }
 
-    #[instrument(skip(self, request), fields(session_id))]
+    #[instrument(skip(self, request, query), fields(session_id))]
     async fn do_action_close_prepared_statement(
         &self,
         query: ActionClosePreparedStatementRequest,
@@ -117,7 +117,7 @@ impl FlightSqlService for SwanFlightSqlService {
         prepared::do_action_close_prepared_statement(self, query, request).await
     }
 
-    #[instrument(skip(self, request), fields(session_id, sql))]
+    #[instrument(skip(self, request, query), fields(session_id, sql))]
     async fn do_put_prepared_statement_update(
         &self,
         query: CommandPreparedStatementUpdate,
@@ -126,7 +126,7 @@ impl FlightSqlService for SwanFlightSqlService {
         prepared::do_put_prepared_statement_update(self, query, request).await
     }
 
-    #[instrument(skip(self, request), fields(session_id))]
+    #[instrument(skip(self, request, query), fields(session_id))]
     async fn do_action_begin_transaction(
         &self,
         query: ActionBeginTransactionRequest,
@@ -135,7 +135,7 @@ impl FlightSqlService for SwanFlightSqlService {
         transaction::do_action_begin_transaction(self, query, request).await
     }
 
-    #[instrument(skip(self, request), fields(session_id, transaction_id))]
+    #[instrument(skip(self, request, query), fields(session_id))]
     async fn do_action_end_transaction(
         &self,
         query: ActionEndTransactionRequest,
