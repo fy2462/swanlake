@@ -1,0 +1,90 @@
+use arrow_flight::sql::{
+    ActionBeginTransactionRequest, ActionBeginTransactionResult, ActionEndTransactionRequest,
+};
+use tonic::{Request, Status};
+use tracing::info;
+
+use crate::service::SwanFlightSqlService;
+
+pub(crate) async fn do_action_begin_transaction(
+    service: &SwanFlightSqlService,
+    _query: ActionBeginTransactionRequest,
+    request: Request<arrow_flight::Action>,
+) -> Result<ActionBeginTransactionResult, Status> {
+    let session = service.prepare_request(&request)?;
+
+    let session_clone = session.clone();
+    let transaction_id = tokio::task::spawn_blocking(move || session_clone.begin_transaction())
+        .await
+        .map_err(SwanFlightSqlService::status_from_join)?
+        .map_err(SwanFlightSqlService::status_from_error)?;
+
+    info!(transaction_id = ?transaction_id, "transaction started in session");
+
+    Ok(ActionBeginTransactionResult {
+        transaction_id: transaction_id.into(),
+    })
+}
+
+pub(crate) async fn do_action_end_transaction(
+    service: &SwanFlightSqlService,
+    query: ActionEndTransactionRequest,
+    request: Request<arrow_flight::Action>,
+) -> Result<(), Status> {
+    let session = service.prepare_request(&request)?;
+
+    let transaction_id = query.transaction_id.to_vec();
+    tracing::Span::current().record("transaction_id", format!("{:?}", transaction_id).as_str());
+
+    let action = query.action;
+
+    let session_clone = session.clone();
+    let txn_id_clone = transaction_id.clone();
+
+    let commit_result = tokio::task::spawn_blocking(move || {
+        if action == 1 {
+            session_clone.commit_transaction(&txn_id_clone)
+        } else {
+            session_clone.rollback_transaction(&txn_id_clone)
+        }
+    })
+    .await
+    .map_err(SwanFlightSqlService::status_from_join)?
+    .map_err(SwanFlightSqlService::status_from_error);
+
+    match commit_result {
+        Ok(()) => {}
+        Err(status) => {
+            if action == 1
+                && status
+                    .message()
+                    .contains("Cannot commit when autocommit is enabled")
+            {
+                info!(
+                    transaction_id = ?transaction_id,
+                    "commit requested while autocommit enabled; treated as no-op"
+                );
+            } else if action != 1
+                && status
+                    .message()
+                    .contains("cannot rollback when autocommit is enabled")
+            {
+                info!(
+                    transaction_id = ?transaction_id,
+                    "rollback requested while autocommit enabled; treated as no-op"
+                );
+            } else {
+                return Err(status);
+            }
+        }
+    }
+
+    let op = if action == 1 {
+        "committed"
+    } else {
+        "rolled back"
+    };
+    info!(transaction_id = ?transaction_id, op, "transaction completed in session");
+
+    Ok(())
+}
