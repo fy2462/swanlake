@@ -1,4 +1,6 @@
+use std::fs;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::Path;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -7,16 +9,6 @@ use serde::{Deserialize, Serialize};
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
-    /// Maximum size of the DuckDB connection pool.
-    pub pool_size: u32,
-    /// Optional size override for the read-only DuckDB connection pool.
-    pub read_pool_size: Option<u32>,
-    /// Optional size override for the write DuckDB connection pool.
-    pub write_pool_size: Option<u32>,
-    /// Whether write operations are permitted.
-    pub enable_writes: bool,
-    /// Whether to install/load the DuckLake extension during startup.
-    pub ducklake_enable: bool,
     /// Optional SQL statement executed during startup for ducklake integration.
     pub ducklake_init_sql: Option<String>,
     /// Maximum number of concurrent sessions.
@@ -25,8 +17,18 @@ pub struct ServerConfig {
     pub session_timeout_seconds: Option<u64>,
     /// Log format: "compact" or "json".
     pub log_format: String,
-    /// Whether to enable ANSI colors in logs.
-    pub log_ansi: bool,
+    /// Persistent directory root for Duckling Queue files.
+    pub duckling_queue_root: String,
+    /// Time-based rotation threshold in seconds.
+    pub duckling_queue_rotate_interval_seconds: u64,
+    /// Size-based rotation threshold in bytes.
+    pub duckling_queue_rotate_size_bytes: u64,
+    /// Interval in seconds for scanning sealed files to flush.
+    pub duckling_queue_flush_interval_seconds: u64,
+    /// Maximum number of parallel flush tasks.
+    pub duckling_queue_max_parallel_flushes: usize,
+    /// Target schema name for flushing Duckling Queue data.
+    pub duckling_queue_target_schema: String,
 }
 
 impl Default for ServerConfig {
@@ -34,16 +36,17 @@ impl Default for ServerConfig {
         Self {
             host: "0.0.0.0".to_string(),
             port: 4214,
-            pool_size: 10,
-            read_pool_size: Some(10),
-            write_pool_size: Some(3),
-            enable_writes: true,
-            ducklake_enable: true,
             ducklake_init_sql: None,
             max_sessions: Some(100),
             session_timeout_seconds: Some(900),
             log_format: "compact".to_string(),
-            log_ansi: true,
+            duckling_queue_root: "target/ducklake-tests/duckling_queue".to_string(),
+            duckling_queue_rotate_interval_seconds: 300,
+            duckling_queue_rotate_size_bytes: 100_000_000,
+            duckling_queue_flush_interval_seconds: 60,
+            duckling_queue_max_parallel_flushes: 2,
+
+            duckling_queue_target_schema: "swanlake".to_string(),
         }
     }
 }
@@ -62,6 +65,7 @@ impl ServerConfig {
         let cfg: ServerConfig = settings
             .try_deserialize()
             .with_context(|| "failed to deserialize configuration")?;
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -70,5 +74,24 @@ impl ServerConfig {
         addr.to_socket_addrs()?
             .next()
             .ok_or_else(|| anyhow::anyhow!("unable to resolve bind address for {addr}"))
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        let root = &self.duckling_queue_root;
+        let path = Path::new(root);
+        if !path.exists() {
+            fs::create_dir_all(path).with_context(|| {
+                format!(
+                    "failed to create duckling queue root directory '{}'",
+                    path.display()
+                )
+            })?;
+        } else if !path.is_dir() {
+            anyhow::bail!(
+                "duckling queue root path '{}' is not a directory",
+                path.display()
+            );
+        }
+        Ok(())
     }
 }

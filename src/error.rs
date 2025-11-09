@@ -6,9 +6,6 @@ pub enum ServerError {
     DuckDb(#[from] duckdb::Error),
     #[error("arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
-
-    #[error("write operations are disabled by configuration")]
-    WritesDisabled,
     #[error("transaction not found")]
     TransactionNotFound,
     #[error("prepared statement not found")]
@@ -17,4 +14,6 @@ pub enum ServerError {
     MaxSessionsReached,
     #[error("unsupported parameter type: {0}")]
     UnsupportedParameter(String),
+    #[error("internal error: {0}")]
+    Internal(String),
 }

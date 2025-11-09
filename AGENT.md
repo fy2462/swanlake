@@ -28,19 +28,12 @@ cargo run
 ```
 
 ## Configuration Cheatsheet
-All env vars use the `SWANLAKE_` prefix.
-
-| Key | Meaning | Default |
-| --- | --- | --- |
-| `HOST` | gRPC bind address | `127.0.0.1` |
-| `PORT` | gRPC port | `4214` |
-| `DUCKDB_PATH` | DuckDB database path (empty → in-memory) | _(unset)_ |
-| `MAX_SESSIONS` | Concurrent session cap | `100` |
-| `SESSION_TIMEOUT_SECONDS` | Idle timeout | `1800` |
-| `DUCKLAKE_ENABLE` | Load DuckLake extension | `true` |
-| `DUCKLAKE_INIT_SQL` | Post-load SQL hook | _(unset)_ |
-| `LOG_FORMAT` | `compact` \| `json` | `compact` |
-| `LOG_ANSI` | Colored logs | `true` |
+All env vars use the `SWANLAKE_` prefix. See [Configuration.md](Configuration.md) for the up-to-date
+table covering defaults and descriptions. Quick reminders:
+- Host/port/pool sizes influence the Flight endpoint + DuckDB pools.
+- `ENABLE_WRITES`, `MAX_SESSIONS`, and `SESSION_TIMEOUT_SECONDS` gate write workloads and cleanup.
+- `DUCKLAKE_INIT_SQL` runs immediately after DuckDB boots (attach remote storage, etc.).
+- Duckling Queue knobs (`DUCKLING_QUEUE_*`) control staging paths plus rotation/flush behavior.
 
 Precedence: env > CLI `--config` > `config.toml` > `.env`.
 
@@ -50,6 +43,7 @@ Precedence: env > CLI `--config` > `config.toml` > `.env`.
 - **Prepared flow**: `CreatePreparedStatement` yields handle + schema, followed by `GetFlightInfo`/`DoGet` (queries) or `DoPut` (updates).
 - **Detection**: `is_query_statement()` strips comments and inspects the first keyword; SELECT/WITH/SHOW/etc. route to query path, everything else goes to update path.
 - **Metadata**: Responses attach `x-swanlake-total-rows` / `x-swanlake-total-bytes` when available.
+- **Duckling Queue admin command**: `PRAGMA duckling_queue.flush;` bypasses the async worker by rotating the active file and flushing every sealed DB immediately (handy for CI/tests).
 
 ## Testing & Tooling
 - `./scripts/test-integration.sh` — end-to-end (builds server, runs Go client tests).

@@ -44,7 +44,7 @@ SwanLake implements a **connection-based session architecture** where each gRPC 
 ### Session Lifecycle
 
 1. **Client Connects**: Opens a gRPC connection to SwanLake
-2. **First Request**: 
+2. **First Request**:
    - SessionID generated from `remote_addr()` (e.g., `"192.168.1.100:54321"`)
    - New session created with dedicated DuckDB connection
    - Extensions loaded (ducklake, httpfs, aws, postgres)
@@ -147,8 +147,6 @@ Updated on every request to prevent premature cleanup.
 max_sessions = 100                  # Maximum concurrent sessions
 session_timeout_seconds = 1800      # 30 minutes
 
-# DuckDB initialization
-ducklake_enable = true
 ducklake_init_sql = """
   ATTACH 's3://my-bucket/data' AS mydata;
   ATTACH 'postgresql://host/db' AS pgdb;
@@ -160,7 +158,6 @@ ducklake_init_sql = """
 ```bash
 export SWANLAKE_MAX_SESSIONS=100
 export SWANLAKE_SESSION_TIMEOUT_SECONDS=1800
-export SWANLAKE_DUCKLAKE_ENABLE=true
 export SWANLAKE_DUCKLAKE_INIT_SQL="ATTACH 's3://bucket/data' AS mydata;"
 ```
 
@@ -168,7 +165,7 @@ export SWANLAKE_DUCKLAKE_INIT_SQL="ATTACH 's3://bucket/data' AS mydata;"
 
 Every new session connection is initialized with:
 
-1. **Extensions** (if `ducklake_enable = true`):
+1. **Extensions**:
    ```sql
    INSTALL ducklake; INSTALL httpfs; INSTALL aws; INSTALL postgres;
    LOAD ducklake; LOAD httpfs; LOAD aws; LOAD postgres;
@@ -232,7 +229,6 @@ pub struct Session {
     transactions: Arc<Mutex<HashMap<TransactionId, Transaction>>>,
     prepared_statements: Arc<Mutex<HashMap<StatementHandle, PreparedStatementState>>>,
     last_activity: Arc<Mutex<Instant>>,
-    writes_enabled: bool,
 }
 
 impl Session {
@@ -283,15 +279,15 @@ async fn handler(
 ) -> Result<Response<R>, Status> {
     // Extract session ID from connection
     let session_id = Self::extract_session_id(&request);
-    
+
     // Get or create session
     let session = self.registry
         .get_or_create_by_id(&session_id)
         .map_err(Self::status_from_error)?;
-    
+
     // Use session to execute operation
     let result = session.execute_query(&sql)?;
-    
+
     // Return response
     Ok(Response::new(result))
 }
@@ -428,12 +424,12 @@ fn extract_session_id<T>(request: &Request<T>) -> SessionId {
     if let Some(header) = request.metadata().get("x-swanlake-session-id") {
         return SessionId::from_string(header.to_str().unwrap().to_string());
     }
-    
+
     // Fall back to connection-based
     if let Some(addr) = request.remote_addr() {
         return SessionId::from_string(addr.to_string());
     }
-    
+
     // Last resort: random
     SessionId::new()
 }
@@ -474,7 +470,7 @@ impl SessionRegistry {
 - Client library not reusing connections
 - Proxy between client and server
 
-**Solution:** 
+**Solution:**
 - Check connection reuse in client
 - Verify `remote_addr()` stability
 - Consider header-based session IDs

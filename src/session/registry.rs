@@ -8,12 +8,14 @@
 //! - Enforces max session limit
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tracing::{debug, info, instrument, warn};
 
 use crate::config::ServerConfig;
+use crate::dq::QueueManager;
 use crate::engine::EngineFactory;
 use crate::error::ServerError;
 use crate::session::id::SessionId;
@@ -23,21 +25,25 @@ use crate::session::Session;
 #[derive(Clone)]
 pub struct SessionRegistry {
     inner: Arc<RwLock<RegistryInner>>,
-    factory: EngineFactory,
+    factory: Arc<Mutex<EngineFactory>>,
     max_sessions: usize,
     session_timeout: Duration,
-    writes_enabled: bool,
 }
 
 struct RegistryInner {
     sessions: HashMap<SessionId, Arc<Session>>,
+    dq_manager: Option<Arc<QueueManager>>,
 }
 
 impl SessionRegistry {
     /// Create a new session registry
-    #[instrument(skip(config))]
-    pub fn new(config: &ServerConfig) -> Result<Self, ServerError> {
-        let factory = EngineFactory::new(config)?;
+    #[instrument(skip(config, dq_manager))]
+    pub fn new(
+        config: &ServerConfig,
+        dq_manager: Option<Arc<QueueManager>>,
+    ) -> Result<Self, ServerError> {
+        // Note: We no longer need a global duckling queue path since each session manages its own
+        let factory = Arc::new(Mutex::new(EngineFactory::new(config, "")?));
         let max_sessions = config.max_sessions.unwrap_or(100);
         let session_timeout = Duration::from_secs(config.session_timeout_seconds.unwrap_or(1800)); // 30min default
 
@@ -50,12 +56,16 @@ impl SessionRegistry {
         Ok(Self {
             inner: Arc::new(RwLock::new(RegistryInner {
                 sessions: HashMap::new(),
+                dq_manager,
             })),
             factory,
             max_sessions,
             session_timeout,
-            writes_enabled: config.enable_writes,
         })
+    }
+
+    pub fn engine_factory(&self) -> Arc<Mutex<EngineFactory>> {
+        self.factory.clone()
     }
 
     /// Clean up idle sessions that have exceeded the timeout
@@ -71,6 +81,10 @@ impl SessionRegistry {
                     idle_duration = ?session.idle_duration(),
                     "removing idle session"
                 );
+                // Seal queue file before removing session
+                if let Err(e) = session.cleanup_queue() {
+                    warn!(session_id = %id, error = %e, "failed to cleanup session queue");
+                }
                 false
             } else {
                 true
@@ -122,14 +136,21 @@ impl SessionRegistry {
         }
 
         // Create new connection
-        let connection = self.factory.create_connection()?;
+        let connection = self.factory.lock().unwrap().create_connection()?;
 
         // Create session with the specified ID
-        let session = Arc::new(Session::new_with_id(
-            session_id.clone(),
-            connection,
-            self.writes_enabled,
-        ));
+        let session = {
+            let inner = self.inner.read().expect("registry lock poisoned");
+            if let Some(ref dq_manager) = inner.dq_manager {
+                Arc::new(Session::new_with_id_and_dq(
+                    session_id.clone(),
+                    connection,
+                    dq_manager.clone(),
+                )?)
+            } else {
+                Arc::new(Session::new_with_id(session_id.clone(), connection))
+            }
+        };
 
         // Register session
         {
@@ -143,5 +164,25 @@ impl SessionRegistry {
         }
 
         Ok(session)
+    }
+
+    /// Call maybe_rotate_queue() on all sessions
+    pub fn maybe_rotate_all_queues(&self) {
+        let sessions = {
+            let inner = self.inner.read().expect("registry lock poisoned");
+            inner.sessions.values().cloned().collect::<Vec<_>>()
+        };
+
+        for session in sessions {
+            if let Err(e) = session.maybe_rotate_queue() {
+                warn!(session_id = %session.id(), error = %e, "failed to rotate session queue");
+            }
+        }
+    }
+
+    /// Get all active session IDs for orphan detection
+    pub fn get_all_session_ids(&self) -> Vec<SessionId> {
+        let inner = self.inner.read().expect("registry lock poisoned");
+        inner.sessions.keys().cloned().collect()
     }
 }

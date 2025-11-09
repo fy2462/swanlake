@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::config::ServerConfig;
+use crate::dq::QueueManager;
 use crate::service::SwanFlightSqlService;
 use anyhow::{Context, Result};
 use tonic::transport::Server;
@@ -8,6 +9,7 @@ use tracing::info;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 mod config;
+mod dq;
 mod engine;
 mod error;
 mod service;
@@ -24,11 +26,22 @@ async fn main() -> Result<()> {
         .bind_addr()
         .context("failed to resolve bind address")?;
 
+    let dq_manager = Arc::new(
+        QueueManager::new(&config).context("failed to initialize duckling queue manager")?,
+    );
+
     // Create session registry (Phase 2: connection-based session persistence)
     let registry = Arc::new(
-        crate::session::registry::SessionRegistry::new(&config)
+        crate::session::registry::SessionRegistry::new(&config, Some(dq_manager.clone()))
             .context("failed to initialize session registry")?,
     );
+
+    // Initialize the QueueRuntime to start background tasks for queue rotation, scanning, flushing, and cleanup.
+    let dq_runtime = Arc::new(dq::QueueRuntime::new(
+        dq_manager.clone(),
+        registry.engine_factory(),
+        registry.clone(),
+    ));
 
     // Spawn periodic session cleanup task
     let registry_clone = registry.clone();
@@ -43,7 +56,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    let flight_service = SwanFlightSqlService::new(registry);
+    // Pass dq_runtime to the service to keep the QueueRuntime alive throughout the server's lifetime.
+    let flight_service = SwanFlightSqlService::new(registry, Some(dq_runtime));
 
     info!(%addr, "starting SwanLake Flight SQL server");
 
@@ -89,6 +103,7 @@ async fn main() -> Result<()> {
         .context("Flight SQL server terminated unexpectedly")?;
 
     info!("server shutdown complete");
+    // Locks held by dq_manager are released here as it goes out of scope
     Ok(())
 }
 
@@ -104,7 +119,6 @@ fn init_tracing(config: &ServerConfig) {
             .with_file(true)
             .with_line_number(true)
             .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
-            .with_ansi(config.log_ansi)
             .init();
     } else {
         tracing_subscriber::fmt()
@@ -114,7 +128,6 @@ fn init_tracing(config: &ServerConfig) {
             .with_file(true)
             .with_line_number(true)
             .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
-            .with_ansi(config.log_ansi)
             .init();
     }
 }

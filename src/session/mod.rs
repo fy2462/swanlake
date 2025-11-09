@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use duckdb::types::Value;
 use tracing::{debug, instrument};
 
+use crate::dq::{QueueManager, QueueSession};
 use crate::engine::{DuckDbConnection, QueryResult};
 use crate::error::ServerError;
 use crate::session::id::{
@@ -79,13 +80,15 @@ pub struct Session {
     transaction_id_gen: Arc<TransactionIdGenerator>,
     statement_handle_gen: Arc<StatementHandleGenerator>,
     last_activity: Arc<Mutex<Instant>>,
-    writes_enabled: bool,
+    // Duckling Queue support
+    dq_manager: Option<Arc<QueueManager>>,
+    dq_queue: Arc<Mutex<Option<QueueSession>>>,
 }
 
 impl Session {
     /// Create a new session with a specific ID (for connection-based persistence)
     #[instrument(skip(connection))]
-    pub fn new_with_id(id: SessionId, connection: DuckDbConnection, writes_enabled: bool) -> Self {
+    pub fn new_with_id(id: SessionId, connection: DuckDbConnection) -> Self {
         debug!(session_id = %id, "created new session with specific ID");
 
         Self {
@@ -96,17 +99,42 @@ impl Session {
             transaction_id_gen: Arc::new(TransactionIdGenerator::new()),
             statement_handle_gen: Arc::new(StatementHandleGenerator::new()),
             last_activity: Arc::new(Mutex::new(Instant::now())),
-            writes_enabled,
+            dq_manager: None,
+            dq_queue: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Update last activity timestamp
-    fn touch(&self) {
-        let mut last = self
-            .last_activity
-            .lock()
-            .expect("last_activity mutex poisoned");
-        *last = Instant::now();
+    /// Create a new session with duckling queue support.
+    /// The queue is attached immediately on session creation.
+    #[instrument(skip(connection, dq_manager))]
+    pub fn new_with_id_and_dq(
+        id: SessionId,
+        connection: DuckDbConnection,
+        dq_manager: Arc<QueueManager>,
+    ) -> Result<Self, ServerError> {
+        debug!(session_id = %id, "creating new session with duckling queue support");
+
+        // Create and attach queue immediately
+        let sq = dq_manager
+            .open_session_queue(id.clone())
+            .map_err(|e| ServerError::Internal(format!("failed to create session queue: {}", e)))?;
+
+        let sql = sq.attach_sql();
+        connection
+            .execute_batch(&sql)
+            .map_err(|e| ServerError::Internal(format!("failed to attach session queue: {}", e)))?;
+
+        Ok(Self {
+            id,
+            connection,
+            transactions: Arc::new(Mutex::new(HashMap::new())),
+            prepared_statements: Arc::new(Mutex::new(HashMap::new())),
+            transaction_id_gen: Arc::new(TransactionIdGenerator::new()),
+            statement_handle_gen: Arc::new(StatementHandleGenerator::new()),
+            last_activity: Arc::new(Mutex::new(Instant::now())),
+            dq_manager: Some(dq_manager),
+            dq_queue: Arc::new(Mutex::new(Some(sq))),
+        })
     }
 
     /// Get time since last activity
@@ -116,6 +144,15 @@ impl Session {
             .lock()
             .expect("last_activity mutex poisoned");
         last.elapsed()
+    }
+
+    /// Update last activity timestamp
+    fn touch(&self) {
+        let mut last = self
+            .last_activity
+            .lock()
+            .expect("last_activity mutex poisoned");
+        *last = Instant::now();
     }
 
     /// Execute a SELECT query
@@ -139,11 +176,71 @@ impl Session {
     /// Execute a statement (DDL/DML)
     #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
     pub fn execute_statement(&self, sql: &str) -> Result<i64, ServerError> {
-        if !self.writes_enabled {
-            return Err(ServerError::WritesDisabled);
+        // Check if this is a DQ admin command first
+        if let Some(result) = self.try_handle_dq_command(sql)? {
+            return Ok(result);
         }
+
         self.touch();
         self.connection.execute_statement(sql)
+    }
+
+    /// Try to handle duckling queue administrative commands.
+    /// Returns Some(affected_rows) if it's a DQ command, None otherwise.
+    fn try_handle_dq_command(&self, sql: &str) -> Result<Option<i64>, ServerError> {
+        let trimmed = sql.trim();
+        let normalized = trimmed.trim_end_matches(';').trim().to_ascii_lowercase();
+
+        if normalized == "pragma duckling_queue.flush"
+            || normalized == "call duckling_queue_flush()"
+        {
+            self.force_flush_own_queue()?;
+            Ok(Some(0))
+        } else if normalized == "pragma duckling_queue.cleanup"
+            || normalized == "call duckling_queue_cleanup()"
+        {
+            let dq_manager = self
+                .dq_manager
+                .as_ref()
+                .ok_or_else(|| ServerError::Internal("no duckling queue manager".into()))?;
+            dq_manager.cleanup_flushed_files().map_err(|e| {
+                ServerError::Internal(format!("failed to cleanup flushed files: {}", e))
+            })?;
+            Ok(Some(0))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Force flush: rotate this session's queue and flush the sealed file immediately.
+    fn force_flush_own_queue(&self) -> Result<(), ServerError> {
+        // Rotate the current session's queue file
+        let sealed_path = self.force_rotate_queue()?;
+
+        // Flush only this session's sealed file synchronously
+        let dq_manager = self
+            .dq_manager
+            .as_ref()
+            .ok_or_else(|| ServerError::Internal("no duckling queue manager".into()))?
+            .clone();
+
+        // Use session's own connection to flush (it's already in a spawn_blocking context)
+        self.connection
+            .with_inner(|conn| {
+                crate::dq::runtime::flush_sealed_file(&dq_manager, conn, &sealed_path)
+            })
+            .map_err(|e| ServerError::Internal(format!("failed to flush queue file: {}", e)))?;
+
+        // Re-attach the active queue to ensure duckling_queue is always available
+        if let Some(sq) = &*self.dq_queue.lock().expect("dq_queue mutex poisoned") {
+            self.connection
+                .execute_batch(&sq.attach_sql())
+                .map_err(|e| {
+                    ServerError::Internal(format!("failed to re-attach active queue: {}", e))
+                })?;
+        }
+
+        Ok(())
     }
 
     /// Execute a statement with parameters
@@ -153,9 +250,6 @@ impl Session {
         sql: &str,
         params: &[Value],
     ) -> Result<usize, ServerError> {
-        if !self.writes_enabled {
-            return Err(ServerError::WritesDisabled);
-        }
         self.touch();
         self.connection.execute_statement_with_params(sql, params)
     }
@@ -256,9 +350,6 @@ impl Session {
     /// Begin a new transaction
     #[instrument(skip(self), fields(session_id = %self.id))]
     pub fn begin_transaction(&self) -> Result<TransactionId, ServerError> {
-        if !self.writes_enabled {
-            return Err(ServerError::WritesDisabled);
-        }
         self.touch();
 
         // Execute BEGIN TRANSACTION on the connection
@@ -278,9 +369,6 @@ impl Session {
     /// Commit a transaction
     #[instrument(skip(self), fields(session_id = %self.id, transaction_id = %transaction_id))]
     pub fn commit_transaction(&self, transaction_id: TransactionId) -> Result<(), ServerError> {
-        if !self.writes_enabled {
-            return Err(ServerError::WritesDisabled);
-        }
         self.touch();
 
         // Verify transaction exists
@@ -303,9 +391,6 @@ impl Session {
     /// Rollback a transaction
     #[instrument(skip(self), fields(session_id = %self.id, transaction_id = %transaction_id))]
     pub fn rollback_transaction(&self, transaction_id: TransactionId) -> Result<(), ServerError> {
-        if !self.writes_enabled {
-            return Err(ServerError::WritesDisabled);
-        }
         self.touch();
 
         // Verify transaction exists
@@ -323,5 +408,62 @@ impl Session {
         transactions.remove(&transaction_id);
         debug!("rolled back transaction");
         Ok(())
+    }
+
+    // === Duckling Queue ===
+
+    /// Check if rotation is needed and rotate if necessary.
+    pub fn maybe_rotate_queue(&self) -> Result<(), ServerError> {
+        let mut queue = self.dq_queue.lock().expect("dq_queue mutex poisoned");
+
+        if let Some(ref mut sq) = *queue {
+            let should_rotate = sq
+                .should_rotate()
+                .map_err(|e| ServerError::Internal(format!("failed to check rotation: {}", e)))?;
+
+            if should_rotate {
+                let sealed = sq
+                    .rotate(&self.connection)
+                    .map_err(|e| ServerError::Internal(format!("failed to rotate queue: {}", e)))?;
+                debug!(session_id = %self.id, sealed_file = %sealed.display(), "session queue rotated");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Force flush: rotate queue and return sealed file path.
+    pub fn force_rotate_queue(&self) -> Result<std::path::PathBuf, ServerError> {
+        let mut queue = self.dq_queue.lock().expect("dq_queue mutex poisoned");
+
+        if let Some(ref mut sq) = *queue {
+            sq.force_flush(&self.connection)
+                .map_err(|e| ServerError::Internal(format!("failed to force flush: {}", e)))
+        } else {
+            Err(ServerError::Internal("no active queue to flush".into()))
+        }
+    }
+
+    /// Seal queue file before session cleanup.
+    pub fn cleanup_queue(&self) -> Result<(), ServerError> {
+        let queue = self
+            .dq_queue
+            .lock()
+            .expect("dq_queue mutex poisoned")
+            .take();
+
+        if let Some(sq) = queue {
+            sq.seal_on_cleanup().map_err(|e| {
+                ServerError::Internal(format!("failed to seal queue on cleanup: {}", e))
+            })?;
+            debug!(session_id = %self.id, "session queue sealed on cleanup");
+        }
+
+        Ok(())
+    }
+
+    /// Get session ID (for use by registry).
+    pub fn id(&self) -> SessionId {
+        self.id.clone()
     }
 }

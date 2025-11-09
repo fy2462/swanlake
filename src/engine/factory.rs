@@ -19,52 +19,45 @@ pub struct EngineFactory {
 impl EngineFactory {
     /// Create a new factory from configuration
     #[instrument(skip(config))]
-    pub fn new(config: &ServerConfig) -> Result<Self, ServerError> {
+    pub fn new(config: &ServerConfig, _duckling_queue_path: &str) -> Result<Self, ServerError> {
         let mut init_statements = Vec::new();
-
-        // Build initialization SQL based on config
-        if config.ducklake_enable {
-            info!("DuckLake extension enabled");
-            init_statements.push(
-                "INSTALL ducklake; INSTALL httpfs; INSTALL aws; INSTALL postgres; \
-                 LOAD ducklake; LOAD httpfs; LOAD aws; LOAD postgres;"
-                    .to_string(),
-            );
-
-            // Add user-provided init SQL
-            if let Some(sql) = config.ducklake_init_sql.as_ref() {
-                let trimmed = sql.trim();
-                if !trimmed.is_empty() {
-                    info!("Adding ducklake init SQL");
-                    init_statements.push(trimmed.to_string());
-                }
+        init_statements.push(
+            "INSTALL ducklake; INSTALL httpfs; INSTALL aws; INSTALL postgres; \
+            LOAD ducklake; LOAD httpfs; LOAD aws; LOAD postgres;"
+                .to_string(),
+        );
+        if let Some(sql) = config.ducklake_init_sql.as_ref() {
+            let trimmed = sql.trim();
+            if !trimmed.is_empty() {
+                info!("Adding ducklake init SQL");
+                init_statements.push(trimmed.to_string());
             }
-        } else {
-            info!("DuckLake extension disabled via configuration");
         }
 
         let init_sql = init_statements.join("\n");
+        info!("base init sql {}", init_sql);
 
         Ok(Self { init_sql })
     }
 
+    /// Create a DuckDB connection with the given init SQL
+    fn create_connection_with_sql(init_sql: &str) -> Result<Connection, ServerError> {
+        let config = Config::default()
+            .enable_autoload_extension(true)?
+            .allow_unsigned_extensions()?;
+        let conn = Connection::open_in_memory_with_flags(config)?;
+        conn.execute_batch(init_sql)?;
+        Ok(conn)
+    }
+
     /// Create a new initialized DuckDB connection
+    ///
+    /// Each connection is created fresh with its own in-memory database.
+    /// This ensures complete isolation between sessions.
     #[instrument(skip(self))]
     pub fn create_connection(&self) -> Result<DuckDbConnection, ServerError> {
-        // Create in-memory connection with extensions enabled
-        let conn = Connection::open_in_memory_with_flags(
-            Config::default()
-                .enable_autoload_extension(true)?
-                .allow_unsigned_extensions()?,
-        )?;
-
-        // Execute initialization SQL (extensions, ATTACH statements, etc.)
-        if !self.init_sql.is_empty() {
-            info!("Initializing connection with extensions and config");
-            conn.execute_batch(&self.init_sql)?;
-        }
-
-        info!("DuckDB connection created and initialized");
+        let conn = Self::create_connection_with_sql(&self.init_sql)?;
+        info!("created new DuckDB connection");
         Ok(DuckDbConnection::new(conn))
     }
 }

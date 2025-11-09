@@ -1,6 +1,5 @@
 [![codecov](https://codecov.io/gh/swanlake-io/swanlake/graph/badge.svg)](https://codecov.io/gh/swanlake-io/swanlake)
 
-
 # SwanLake
 
 SwanLake is a Rust-based Arrow Flight SQL server backed by DuckDB with optional DuckLake extensions. It delivers per-connection sessions, streaming analytics, and a compact deployment footprint.
@@ -9,6 +8,7 @@ SwanLake is a Rust-based Arrow Flight SQL server backed by DuckDB with optional 
 - Arrow Flight SQL endpoint with prepared statement and streaming result support
 - Session-scoped DuckDB connections for predictable state management
 - Optional DuckLake extension loading and initialization hooks
+- Duckling Queue staging layer with `PRAGMA duckling_queue.flush` for crash-resilient write buffering
 - Structured logging and configurability via environment variables or `config.toml`
 
 ## Quick Start
@@ -22,21 +22,18 @@ cargo run
 ```
 
 ## Configuration
-Key environment variables (all prefixed with `SWANLAKE_`):
-
-| Variable | Description | Default |
-| --- | --- | --- |
-| `HOST` | Bind address | `127.0.0.1` |
-| `PORT` | gRPC port | `4214` |
-| `DUCKDB_PATH` | DuckDB database path (blank = in-memory) | _unset_ |
-| `MAX_SESSIONS` | Concurrent session limit | `100` |
-| `SESSION_TIMEOUT_SECONDS` | Idle session timeout | `1800` |
-| `DUCKLAKE_ENABLE` | Auto-load DuckLake extension | `true` |
-| `DUCKLAKE_INIT_SQL` | SQL executed after DuckLake loads | _unset_ |
-| `LOG_FORMAT` | `compact` or `json` | `compact` |
-| `LOG_ANSI` | Enable ANSI colors | `true` |
+All configuration options (env vars + defaults) live in [Configuration.md](Configuration.md).
+Highlights:
+- `SWANLAKE_HOST` / `SWANLAKE_PORT` control the Flight endpoint bind address.
+- `SWANLAKE_ENABLE_WRITES`, `SWANLAKE_MAX_SESSIONS`, and `SWANLAKE_SESSION_TIMEOUT_SECONDS`
+  gate write access and session lifecycle.
+- `SWANLAKE_DUCKLAKE_INIT_SQL` runs custom SQL immediately after DuckDB starts.
+- Duckling Queue settings (root path, rotation/flush thresholds, target schema) are also covered there.
 
 `.env` files are read automatically via `dotenvy`. Command-line flags always override file-based configuration.
+
+Every session can create or insert into `duckling_queue.*` tables. Use
+`PRAGMA duckling_queue.flush;` to force the active file to rotate and flush immediately (handy for tests and CI).
 
 ## Testing
 
@@ -48,22 +45,8 @@ Key environment variables (all prefixed with `SWANLAKE_`):
 The standalone test runner (`tests/runner`) executes SQL logic tests against a running SwanLake server:
 
 ```bash
-# Start the server
-cargo run
-
-# In another terminal, run SQL tests
-cd tests/runner
-cargo run -- --endpoint grpc://127.0.0.1:4214 ../../tests/sql/ducklake_basic.test
-
-# Or use the helper script
-./scripts/run_ducklake_tests.sh
+bash ./scripts/run-integration-tests.sh
 ```
-
-The test runner uses Arrow 56.x for ADBC compatibility, while the main project uses Arrow 57.x.
-
-## Documentation
-- `AGENT.md` offers a guided tour of the architecture for contributors.
-- `docs/session.md` explains session lifecycle, metadata, and protocol handling.
 
 ## License
 

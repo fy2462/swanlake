@@ -6,11 +6,19 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   ci:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.head_ref }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -19,6 +27,12 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: "1.25"
+
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@v1
+
+      - name: Start services
+        run: docker compose up -d
 
       - name: Cache DuckDB
         uses: actions/cache@v3
@@ -29,17 +43,26 @@ jobs:
       - name: Setup DuckDB
         run: bash scripts/setup_duckdb.sh
 
-      - name: Check formatting
-        run: cargo fmt --check
+      - name: Fix formatting
+        run: cargo fmt
 
-      - name: Run clippy
-        run: cargo clippy -- -D warnings
+      - name: Fix clippy
+        run: cargo clippy --fix --allow-dirty --allow-staged -- -D warnings
+
+      - uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: Auto-fix formatting and clippy issues
+          file_pattern: "*.rs"
 
       - name: Install llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Run integration tests
         run: bash scripts/run-integration-tests.sh
+        env:
+          PGPASSWORD: postgres
+          PGHOST: 127.0.0.1
+          PGUSER: postgres
 
       - name: Collect coverage
         run: |
