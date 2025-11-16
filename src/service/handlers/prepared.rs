@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::{new_null_array, RecordBatch};
+use arrow_cast::cast;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::sql::server::PeekableFlightDataStream;
 use arrow_flight::sql::{
@@ -9,6 +12,8 @@ use arrow_flight::sql::{
     TicketStatementQuery,
 };
 use arrow_flight::{FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
+use arrow_schema::Schema;
+
 use prost::Message;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info};
@@ -35,7 +40,17 @@ pub(crate) async fn do_action_create_prepared_statement(
     request: Request<arrow_flight::Action>,
 ) -> Result<ActionCreatePreparedStatementResult, Status> {
     let sql = query.query;
-    let is_query = SwanFlightSqlService::is_query_statement(&sql);
+
+    // Try to parse SQL to determine if this is a query, but don't fail if it can't be parsed
+    // (e.g., multi-statement SQL or vendor-specific syntax)
+    let is_query = if let Some(parsed) = crate::sql_parser::ParsedStatement::parse(&sql) {
+        parsed.is_query()
+    } else {
+        // Fallback: treat multi-statement or unparseable SQL as non-query (safer default)
+        // User will get appropriate error when trying to execute if this is wrong
+        false
+    };
+
     tracing::Span::current().record("is_query", is_query);
     let session = service.prepare_request(&request).await?;
 
@@ -276,25 +291,89 @@ pub(crate) async fn do_put_prepared_statement_update(
         ));
     }
 
-    let parameter_sets = SwanFlightSqlService::collect_parameter_sets(request).await?;
+    let parsed_opt = crate::sql_parser::ParsedStatement::parse(&sql);
 
-    let parameter_set_count = parameter_sets.len();
+    let affected_rows = if parsed_opt.as_ref().is_some_and(|p| p.is_insert()) {
+        let batches = SwanFlightSqlService::collect_record_batches(request).await?;
+        if batches.is_empty() {
+            // No batches, execute with empty params
+            let session_clone = Arc::clone(&session);
+            tokio::task::spawn_blocking(move || {
+                SwanFlightSqlService::execute_statement_batches(&sql, &[], &session_clone)
+            })
+            .await
+            .map_err(SwanFlightSqlService::status_from_join)?
+            .map_err(SwanFlightSqlService::status_from_error)?
+        } else {
+            let parsed = parsed_opt.unwrap();
+            let table_ref = parsed.get_insert_table().ok_or_else(|| {
+                Status::invalid_argument("failed to extract table name from INSERT statement")
+            })?;
+            let table_sql_name = table_ref.sql_name().to_string();
+            let table_logical_name = table_ref.logical_name().to_string();
+            let insert_columns = parsed.get_insert_columns();
 
-    info!(
-        handle = %handle,
-        sql = %sql,
-        parameter_sets = parameter_set_count,
-        "executing prepared statement update"
-    );
+            info!(
+                handle = %handle,
+                table_name = %table_sql_name,
+                "using appender optimization for INSERT"
+            );
 
-    let session_clone = Arc::clone(&session);
+            let session_clone = Arc::clone(&session);
+            tokio::task::spawn_blocking(move || {
+                let table_schema = Arc::new(session_clone.table_schema(&table_sql_name)?);
+                let batches_to_use = if let Some(cols) = &insert_columns {
+                    batches
+                        .into_iter()
+                        .map(|batch| {
+                            SwanFlightSqlService::align_batch_to_table_schema(
+                                batch,
+                                &table_schema,
+                                cols,
+                                &table_logical_name,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, crate::error::ServerError>>()?
+                } else {
+                    batches
+                };
+                let mut total_rows = 0usize;
+                for batch in batches_to_use {
+                    let rows = session_clone
+                        .insert_with_appender(&table_logical_name, batch)
+                        .map_err(|e| {
+                            error!(
+                                %e,
+                                "appender insert failed sql {} for table {}",
+                                sql,
+                                table_sql_name
+                            );
+                            e
+                        })?;
+                    total_rows += rows;
+                }
+                Ok::<_, crate::error::ServerError>(total_rows as i64)
+            })
+            .await
+            .map_err(SwanFlightSqlService::status_from_join)?
+            .map_err(SwanFlightSqlService::status_from_error)?
+        }
+    } else {
+        let params = SwanFlightSqlService::collect_parameter_sets(request).await?;
+        info!(
+            handle = %handle,
+            sql = %sql,
+            "executing prepared statement update with parameters"
+        );
 
-    let affected_rows = tokio::task::spawn_blocking(move || {
-        SwanFlightSqlService::execute_statement_batches(&sql, &parameter_sets, &session_clone)
-    })
-    .await
-    .map_err(SwanFlightSqlService::status_from_join)?
-    .map_err(SwanFlightSqlService::status_from_error)?;
+        let session_clone = Arc::clone(&session);
+        tokio::task::spawn_blocking(move || {
+            SwanFlightSqlService::execute_statement_batches(&sql, &params, &session_clone)
+        })
+        .await
+        .map_err(SwanFlightSqlService::status_from_join)?
+        .map_err(SwanFlightSqlService::status_from_error)?
+    };
 
     info!(
         handle = %handle,
@@ -302,4 +381,48 @@ pub(crate) async fn do_put_prepared_statement_update(
         "prepared statement update complete"
     );
     Ok(affected_rows)
+}
+
+impl SwanFlightSqlService {
+    fn align_batch_to_table_schema(
+        batch: RecordBatch,
+        table_schema: &Arc<Schema>,
+        column_order: &[String],
+        table_name: &str,
+    ) -> Result<RecordBatch, crate::error::ServerError> {
+        if batch.num_columns() != column_order.len() {
+            return Err(crate::error::ServerError::Internal(format!(
+                "column count mismatch for table {table_name}: got {} columns but SQL specified {}",
+                batch.num_columns(),
+                column_order.len()
+            )));
+        }
+
+        let index_lookup: HashMap<&str, usize> = column_order
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| (name.as_str(), idx))
+            .collect();
+
+        let mut columns = Vec::with_capacity(table_schema.fields().len());
+        for field in table_schema.fields() {
+            if let Some(idx) = index_lookup.get(field.name().as_str()) {
+                let column = batch.column(*idx);
+                let batch_schema = batch.schema();
+                let source_field = batch_schema.field(*idx);
+                if source_field.data_type() == field.data_type() {
+                    columns.push(column.clone());
+                } else {
+                    let casted = cast(column.as_ref(), field.data_type())
+                        .map_err(crate::error::ServerError::Arrow)?;
+                    columns.push(casted);
+                }
+            } else {
+                columns.push(new_null_array(field.data_type(), batch.num_rows()));
+            }
+        }
+
+        RecordBatch::try_new(table_schema.clone(), columns)
+            .map_err(crate::error::ServerError::Arrow)
+    }
 }

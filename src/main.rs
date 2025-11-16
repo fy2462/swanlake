@@ -16,6 +16,8 @@ mod error;
 mod lock;
 mod service;
 mod session;
+mod sql_parser;
+mod types;
 
 #[tokio::main]
 async fn main() -> Result<()> {

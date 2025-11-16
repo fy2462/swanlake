@@ -6,12 +6,13 @@
 use std::sync::Mutex;
 
 use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_schema::{Field, Schema};
 use duckdb::types::Value;
 use duckdb::{params_from_iter, Connection};
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument};
 
 use crate::error::ServerError;
+use crate::types::duckdb_type_to_arrow;
 
 /// Result of a query execution
 pub struct QueryResult {
@@ -202,11 +203,89 @@ impl DuckDbConnection {
     }
 
     /// Execute a closure with access to the inner duckdb::Connection
-    pub fn with_inner<F, R>(&self, f: F) -> R
+    pub fn with_inner<F, R>(&self, f: F) -> Result<R, ServerError>
     where
         F: FnOnce(&duckdb::Connection) -> R,
     {
-        let conn = self.conn.lock().expect("connection mutex poisoned");
-        f(&conn)
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| ServerError::Internal("connection mutex poisoned".to_string()))?;
+        Ok(f(&conn))
+    }
+
+    /// Insert data using DuckDB's appender API with a RecordBatch.
+    ///
+    /// This method is optimized for bulk inserts as it avoids converting
+    /// RecordBatch to individual parameter values, reducing memory copies.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_name` - The name of the table to insert into
+    /// * `batch` - The RecordBatch containing data to insert
+    ///
+    /// # Returns
+    ///
+    /// The number of rows inserted
+    #[instrument(skip(self, batch), fields(table_name = %table_name, rows = batch.num_rows()))]
+    pub fn insert_with_appender(
+        &self,
+        table_name: &str,
+        batch: RecordBatch,
+    ) -> Result<usize, ServerError> {
+        let row_count = batch.num_rows();
+        info!(
+            "appender to {} with row {} and column {}",
+            table_name,
+            row_count,
+            batch.num_columns()
+        );
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| ServerError::Internal("connection mutex poisoned".to_string()))?;
+        let mut appender = conn.appender(table_name)?;
+        appender.append_record_batch(batch)?;
+        appender.flush()?;
+
+        debug!(
+            rows = row_count,
+            table = %table_name,
+            "inserted data using appender"
+        );
+
+        Ok(row_count)
+    }
+
+    /// Get the schema of a table using DESC SELECT
+    pub fn table_schema(&self, table_name: &str) -> Result<arrow_schema::Schema, ServerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| ServerError::Internal("connection mutex poisoned".to_string()))?;
+
+        // Use DESC to get table schema without preparing parameters
+        let desc_query = format!("DESC SELECT * FROM {}", table_name);
+        let mut stmt = conn.prepare(&desc_query).map_err(ServerError::DuckDb)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?, // column_name
+                    row.get::<_, String>(1)?, // column_type
+                    row.get::<_, String>(2)?, // null (YES or NO)
+                ))
+            })
+            .map_err(ServerError::DuckDb)?;
+
+        let mut fields = Vec::new();
+        for row in rows {
+            let (name, duckdb_type, null_str) = row.map_err(ServerError::DuckDb)?;
+            let data_type = duckdb_type_to_arrow(&duckdb_type)?;
+            let nullable = null_str == "YES";
+            fields.push(Field::new(&name, data_type, nullable));
+        }
+
+        Ok(Schema::new(fields))
     }
 }

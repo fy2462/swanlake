@@ -7,13 +7,7 @@ use std::process;
 use std::sync::{Arc, Once};
 
 use anyhow::{anyhow, bail, Context, Result};
-#[allow(unused_imports)]
-use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, StringArray,
-    TimestampMicrosecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
-};
-
+use arrow_array::Array;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use flight_sql_client::{arrow::array_value_to_string, FlightSQLClient, StatementResult};
@@ -78,7 +72,7 @@ impl FlightSqlDb {
                             if column.is_null(row_idx) {
                                 row.push("NULL".to_string());
                             } else {
-                                row.push(array_value_to_string(column.as_ref(), row_idx)?);
+                                row.push(format_value(column.as_ref(), row_idx)?);
                             }
                         }
                         rows.push(row);
@@ -339,6 +333,10 @@ async fn run_sqllogictest(args: &CliArgs) -> Result<()> {
     info!("All SQLLogicTest scripts completed");
 
     Ok(())
+}
+
+fn format_value(array: &dyn Array, idx: usize) -> Result<String> {
+    array_value_to_string(array, idx).map_err(|e| anyhow!(e))
 }
 
 fn init_logging() {

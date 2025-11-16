@@ -127,25 +127,30 @@ async fn flush_loop(
         let factory_clone = factory.clone();
         let path_for_log = path.clone();
         tokio::spawn(async move {
-            // Acquire lock first (async operation)
+            // Acquire distributed lock before flushing to avoid double-processing.
             let lock_result =
                 PostgresLock::try_acquire(&path, manager_clone.settings().lock_ttl, None).await;
 
             let flush_result = match lock_result {
-                Ok(Some(_lock)) => {
-                    // Lock acquired, now do the flush with sync DuckDB operations
-                    let conn = factory_clone.lock().unwrap().create_connection();
-                    match conn {
-                        Ok(conn) => conn.with_inner(|inner| {
-                            flush_sealed_file_sync(&manager_clone, inner, &path)
-                        }),
-                        Err(e) => Err(e.into()),
-                    }
+                Ok(Some(lock)) => {
+                    let manager_for_flush = manager_clone.clone();
+                    let factory_for_flush = factory_clone.clone();
+                    let path_for_flush = path.clone();
+
+                    tokio::task::spawn_blocking(move || {
+                        // Hold the lock for the duration of sync DuckDB operations.
+                        let _lock = lock;
+                        let conn = factory_for_flush.lock().unwrap().create_connection()?;
+                        conn.with_inner(|inner| {
+                            flush_sealed_file_sync(&manager_for_flush, inner, &path_for_flush)
+                        })
+                        .map_err(|e| anyhow!(e))?
+                    })
+                    .await
+                    .map_err(|join_err| anyhow!(join_err))
+                    .and_then(|res| res)
                 }
-                Ok(None) => {
-                    // Lock not acquired - file busy
-                    Ok(false)
-                }
+                Ok(None) => Ok(false),
                 Err(e) => Err(e),
             };
 

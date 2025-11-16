@@ -29,7 +29,7 @@ use tracing::{debug, error, info, instrument};
 use crate::dq::{QueueManager, QueueSession};
 use crate::engine::{DuckDbConnection, QueryResult};
 use crate::error::ServerError;
-use crate::lock::DistributedLock;
+use crate::lock::{DistributedLock, PostgresLock};
 use crate::session::id::{
     StatementHandle, StatementHandleGenerator, TransactionId, TransactionIdGenerator,
 };
@@ -273,24 +273,28 @@ impl Session {
             .ok_or_else(|| ServerError::Internal("no duckling queue manager".into()))?
             .clone();
 
-        // Use session's own connection to flush
-        // Acquire lock first (this is safe here because execute_statement is called from spawn_blocking)
+        // Acquire distributed lock before flushing to avoid double-processing.
         let _lock = tokio::runtime::Handle::current()
             .block_on(async {
-                crate::lock::PostgresLock::try_acquire(
+                PostgresLock::try_acquire(
                     &sealed_path,
-                    std::time::Duration::from_secs(60),
-                    None,
+                    dq_manager.settings().lock_ttl,
+                    Some(self.id.as_ref()),
                 )
                 .await
             })
             .map_err(|e| ServerError::Internal(format!("failed to acquire lock: {}", e)))?
             .ok_or_else(|| ServerError::Internal("failed to acquire lock for flush".into()))?;
 
-        self.connection
+        // Use session's own connection to flush (execute_statement already runs inside spawn_blocking)
+        let flush_result = self
+            .connection
             .with_inner(|conn| {
                 crate::dq::runtime::flush_sealed_file_sync(&dq_manager, conn, &sealed_path)
             })
+            .map_err(|e| ServerError::Internal(format!("failed to flush queue file: {}", e)))?;
+
+        let _ = flush_result
             .map_err(|e| ServerError::Internal(format!("failed to flush queue file: {}", e)))?;
 
         // Re-attach the active queue to ensure duckling_queue is always available
@@ -326,6 +330,40 @@ impl Session {
     pub fn schema_for_query(&self, sql: &str) -> Result<arrow_schema::Schema, ServerError> {
         self.touch();
         self.connection.schema_for_query(sql)
+    }
+
+    /// Insert data using appender API with RecordBatch.
+    ///
+    /// This is an optimized path for INSERT statements that avoids
+    /// converting RecordBatch to individual parameter values.
+    #[instrument(skip(self, batch), fields(session_id = %self.id, table_name = %table_name, rows = batch.num_rows()))]
+    pub fn insert_with_appender(
+        &self,
+        table_name: &str,
+        batch: arrow_array::RecordBatch,
+    ) -> Result<usize, ServerError> {
+        self.touch();
+        // Clone batch once for potential retry (RecordBatch uses Arc internally, so clone is cheap)
+        let batch_for_retry = batch.clone();
+        match self.connection.insert_with_appender(table_name, batch) {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                let table_name_owned = table_name.to_string();
+                self.maybe_create_queue_table_and_retry(
+                    &format!("INSERT INTO {}", table_name),
+                    err,
+                    || {
+                        self.connection
+                            .insert_with_appender(&table_name_owned, batch_for_retry)
+                    },
+                )
+            }
+        }
+    }
+
+    /// Get the schema of a table
+    pub fn table_schema(&self, table_name: &str) -> Result<arrow_schema::Schema, ServerError> {
+        self.connection.table_schema(table_name)
     }
 
     // === Prepared Statements ===
