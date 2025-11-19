@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 # Common base with toolchain deps and cargo-chef
 FROM rust:slim AS base
 
@@ -17,9 +19,16 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Build stage
 FROM base AS builder
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json --locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo chef cook --release --recipe-path recipe.json --locked
 COPY . .
-RUN cargo build --release --locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --locked \
+    && cp target/release/swanlake /app/swanlake
 
 # Runtime stage
 FROM debian:trixie-slim
@@ -36,7 +45,7 @@ COPY --from=ghcr.io/grpc-ecosystem/grpc-health-probe:v0.4.41 /ko-app/grpc-health
 COPY --from=builder /app/.duckdb .duckdb
 
 # Copy built binary
-COPY --from=builder /app/target/release/swanlake swanlake
+COPY --from=builder /app/swanlake swanlake
 
 # Copy scripts for tests
 COPY --from=builder /app/scripts scripts/
@@ -46,7 +55,8 @@ COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Create non-root user and switch to it
-RUN groupadd -r swanlake -g 4214 && useradd -r -u 4214 -g swanlake -d /app swanlake && \
+RUN sed -i 's/SYS_UID_MAX 999/SYS_UID_MAX 9999/' /etc/login.defs && \
+    groupadd -r swanlake -g 4214 && useradd -r -u 4214 -g swanlake -d /app swanlake && \
     chown -R swanlake:swanlake /app
 USER swanlake
 
