@@ -1,4 +1,4 @@
-/target
+target
 .duckdb/
 .env
 .env.*
@@ -16,6 +16,7 @@ examples/rust-client/Cargo.lock
 examples/rust-adbc/Cargo.lock
 tests/runner/Cargo.lock
 tests/runner/target
+clients/target
 
 lcov.info
 .vscode/
@@ -25,3 +26,5 @@ test_*
 .python-version
 uv.lock
 __marimo__
+
+recipe.json

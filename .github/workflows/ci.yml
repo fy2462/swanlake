@@ -66,16 +66,11 @@ jobs:
           path: .duckdb
           key: duckdb-${{ runner.os }}
 
-      - name: Fix formatting
-        run: cargo fmt
+      - name: Check formatting
+        run: cargo fmt -- --check
 
-      - name: Fix clippy
-        run: cargo clippy --fix --allow-dirty --allow-staged -- -D warnings
-
-      - uses: stefanzweifel/git-auto-commit-action@v7
-        with:
-          commit_message: Auto-fix formatting and clippy issues
-          file_pattern: "*.rs"
+      - name: Check clippy
+        run: cargo clippy --workspace -- -D warnings
 
       - name: Install llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -103,11 +98,8 @@ jobs:
           PGUSER: postgres
           SWANLAKE_DUCKDB_UI_SERVER_ENABLED: true
 
-      - name: Upload coverage to codecov
-        uses: codecov/codecov-action@v5
-        with:
-          file: lcov.info
-          token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Coveralls GitHub Action
+        uses: coverallsapp/github-action@v2.3.6
 
   docker:
     runs-on: ubuntu-latest
@@ -132,12 +124,13 @@ jobs:
         with:
           context: .
           push: true
+          file: ./swanlake-server/Dockerfile
           tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
 
       - name: Run health check in Docker
-        run: docker run --rm ghcr.io/${{ github.repository }}:${{ github.sha }} sh -c './swanlake & sleep 5 && grpc-health-probe -addr=localhost:4214'
+        run: docker run --rm ghcr.io/${{ github.repository }}:${{ github.sha }} sh -c 'swanlake & sleep 5 && grpc-health-probe -addr=localhost:4214'
 
       - name: Tag and push latest
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
