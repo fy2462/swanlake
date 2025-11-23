@@ -15,6 +15,8 @@ mkdir -p "$TEST_DIR"
 export SWANLAKE_DUCKLING_QUEUE_ENABLED=true
 export SWANLAKE_DUCKLING_QUEUE_ROOT="$TEST_DIR/duckling_queue"
 mkdir -p "$SWANLAKE_DUCKLING_QUEUE_ROOT"
+export SWANLAKE_DUCKLING_QUEUE_DLQ_TARGET="$TEST_DIR/duckling_dlq"
+mkdir -p "$SWANLAKE_DUCKLING_QUEUE_DLQ_TARGET"
 
 export SWANLAKE_DUCKLAKE_INIT_SQL="ATTACH 'ducklake:postgres:dbname=swanlake_test' AS swanlake (DATA_PATH '$TEST_DIR/swanlake_files', OVERRIDE_DATA_PATH true);"
 export RUST_LOG="${RUST_LOG:-info,swanlake::dq=debug}"
@@ -161,7 +163,20 @@ cd "$ROOT_DIR/examples/python-adbc"
 uv run main.py
 cd -
 
+# Run Python marimo example
+cd "$ROOT_DIR/examples/python-marimo"
+uv run swanlake.py
+cd -
+
 # Give a moment for profraw files to be fully written
 sleep 2
 
+cleanup_server
+
 echo "Integration tests completed. Coverage data collected in target/llvm-cov-target/"
+
+# ============================================================================
+# Generate Coverage Report
+# ============================================================================
+
+cargo llvm-cov report --lcov --output-path "$ROOT_DIR/lcov.info"

@@ -17,7 +17,7 @@ pub use id::SessionId;
 // - A dedicated DuckDB connection (persistent state)
 // - Transaction state
 // - Prepared statements
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema};
 use duckdb::types::Value;
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::dq::DqCoordinator;
 use crate::engine::{DuckDbConnection, QueryResult};
@@ -140,6 +140,7 @@ pub struct Session {
     id: SessionId,
     connection: DuckDbConnection,
     transactions: Arc<Mutex<HashMap<TransactionId, Transaction>>>,
+    aborted_transactions: Arc<Mutex<HashSet<TransactionId>>>,
     prepared_statements: Arc<Mutex<HashMap<StatementHandle, PreparedStatementState>>>,
     transaction_id_gen: Arc<TransactionIdGenerator>,
     statement_handle_gen: Arc<StatementHandleGenerator>,
@@ -157,6 +158,7 @@ impl Session {
             id,
             connection,
             transactions: Arc::new(Mutex::new(HashMap::new())),
+            aborted_transactions: Arc::new(Mutex::new(HashSet::new())),
             prepared_statements: Arc::new(Mutex::new(HashMap::new())),
             transaction_id_gen: Arc::new(TransactionIdGenerator::new()),
             statement_handle_gen: Arc::new(StatementHandleGenerator::new()),
@@ -178,6 +180,7 @@ impl Session {
             id,
             connection,
             transactions: Arc::new(Mutex::new(HashMap::new())),
+            aborted_transactions: Arc::new(Mutex::new(HashSet::new())),
             prepared_statements: Arc::new(Mutex::new(HashMap::new())),
             transaction_id_gen: Arc::new(TransactionIdGenerator::new()),
             statement_handle_gen: Arc::new(StatementHandleGenerator::new()),
@@ -204,12 +207,108 @@ impl Session {
         *last = Instant::now();
     }
 
+    /// Run an operation and automatically roll back if DuckDB reports an aborted transaction.
+    /// After rollback, retry the operation once.
+    fn with_transaction_recovery<T, F>(&self, op: F) -> Result<T, ServerError>
+    where
+        F: Fn() -> Result<T, ServerError>,
+    {
+        match op() {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                if Self::is_transaction_abort_error(&err) {
+                    self.recover_from_transaction_abort(&err);
+                    // Retry once after rollback
+                    op()
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    /// Run an operation without retry on transaction abort (for operations that move data).
+    fn with_transaction_recovery_no_retry<T, F>(&self, op: F) -> Result<T, ServerError>
+    where
+        F: FnOnce() -> Result<T, ServerError>,
+    {
+        match op() {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                self.recover_from_transaction_abort(&err);
+                Err(err)
+            }
+        }
+    }
+
+    /// Detect the "transaction aborted" state and roll back so the session can be reused.
+    fn recover_from_transaction_abort(&self, err: &ServerError) {
+        if !Self::is_transaction_abort_error(err) {
+            return;
+        }
+
+        warn!(error = %err, "transaction aborted; rolling back session state");
+
+        match self.connection.execute_batch("ROLLBACK") {
+            Ok(()) => {
+                let (cleared, cleared_ids) = {
+                    let mut txs = self
+                        .transactions
+                        .lock()
+                        .expect("transactions mutex poisoned");
+                    let cleared = txs.len();
+                    let ids = txs.keys().copied().collect::<Vec<_>>();
+                    txs.clear();
+                    (cleared, ids)
+                };
+                if !cleared_ids.is_empty() {
+                    let mut aborted = self
+                        .aborted_transactions
+                        .lock()
+                        .expect("aborted_transactions mutex poisoned");
+                    for id in cleared_ids {
+                        aborted.insert(id);
+                    }
+                }
+                info!(
+                    cleared_transactions = cleared,
+                    "auto-rolled back aborted transaction"
+                );
+            }
+            Err(rollback_err) => {
+                warn!(error = %rollback_err, "failed to rollback aborted transaction");
+            }
+        }
+    }
+
+    fn is_transaction_abort_error(err: &ServerError) -> bool {
+        match err {
+            ServerError::DuckDb(duck_err) => {
+                let msg = duck_err.to_string();
+                msg.contains("Current transaction is aborted")
+                    || msg.contains("TransactionContext Error")
+            }
+            _ => false,
+        }
+    }
+
+    fn transaction_absent_error(&self, transaction_id: TransactionId) -> Result<(), ServerError> {
+        let mut aborted = self
+            .aborted_transactions
+            .lock()
+            .expect("aborted_transactions mutex poisoned");
+        if aborted.remove(&transaction_id) {
+            return Err(ServerError::TransactionAborted);
+        }
+        Err(ServerError::TransactionNotFound)
+    }
+
     /// Execute a SELECT query
     #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult, ServerError> {
         self.ensure_duckling_queue_usage_allowed(sql)?;
         self.touch();
-        self.connection.execute_query(sql)
+        self.with_transaction_recovery(|| self.connection.execute_query(sql))
     }
 
     /// Execute a query with parameters
@@ -221,7 +320,7 @@ impl Session {
     ) -> Result<QueryResult, ServerError> {
         self.ensure_duckling_queue_usage_allowed(sql)?;
         self.touch();
-        self.connection.execute_query_with_params(sql, params)
+        self.with_transaction_recovery(|| self.connection.execute_query_with_params(sql, params))
     }
 
     /// Execute a statement (DDL/DML)
@@ -236,7 +335,7 @@ impl Session {
         }
 
         self.touch();
-        self.connection.execute_statement(sql)
+        self.with_transaction_recovery(|| self.connection.execute_statement(sql))
     }
 
     /// Try to handle duckling queue administrative commands.
@@ -318,10 +417,12 @@ impl Session {
         // Execute the source SQL as a query to get Arrow batches
         // This converts "VALUES (?)" or "SELECT ..." into Arrow format
         let result = if let Some(values) = params {
-            self.connection
-                .execute_query_with_params(&source_sql, values)?
+            self.with_transaction_recovery(|| {
+                self.connection
+                    .execute_query_with_params(&source_sql, values)
+            })?
         } else {
-            self.connection.execute_query(&source_sql)?
+            self.with_transaction_recovery(|| self.connection.execute_query(&source_sql))?
         };
 
         if result.total_rows == 0 {
@@ -404,7 +505,9 @@ impl Session {
         }
 
         self.touch();
-        self.connection.execute_statement_with_params(sql, params)
+        self.with_transaction_recovery(|| {
+            self.connection.execute_statement_with_params(sql, params)
+        })
     }
 
     /// Get schema for a query
@@ -412,7 +515,7 @@ impl Session {
     pub fn schema_for_query(&self, sql: &str) -> Result<arrow_schema::Schema, ServerError> {
         self.ensure_duckling_queue_usage_allowed(sql)?;
         self.touch();
-        self.connection.schema_for_query(sql)
+        self.with_transaction_recovery(|| self.connection.schema_for_query(sql))
     }
 
     /// Insert data using appender API with RecordBatches.
@@ -427,18 +530,20 @@ impl Session {
         batches: Vec<arrow_array::RecordBatch>,
     ) -> Result<usize, ServerError> {
         self.touch();
-        self.connection
-            .insert_with_appender(catalog_name, table_name, batches)
+        self.with_transaction_recovery_no_retry(|| {
+            self.connection
+                .insert_with_appender(catalog_name, table_name, batches)
+        })
     }
 
     /// Get the schema of a table
     pub fn table_schema(&self, table_name: &str) -> Result<arrow_schema::Schema, ServerError> {
-        self.connection.table_schema(table_name)
+        self.with_transaction_recovery(|| self.connection.table_schema(table_name))
     }
 
     /// Return the current catalog selected for this session.
     pub fn current_catalog(&self) -> Result<String, ServerError> {
-        self.connection.current_catalog()
+        self.with_transaction_recovery(|| self.connection.current_catalog())
     }
 
     fn rename_batch_columns(
@@ -642,7 +747,7 @@ impl Session {
         self.touch();
 
         // Execute BEGIN TRANSACTION on the connection
-        self.connection.execute_batch("BEGIN TRANSACTION")?;
+        self.with_transaction_recovery(|| self.connection.execute_batch("BEGIN TRANSACTION"))?;
 
         let tx_id = self.transaction_id_gen.next();
         let mut transactions = self
@@ -660,19 +765,31 @@ impl Session {
     pub fn commit_transaction(&self, transaction_id: TransactionId) -> Result<(), ServerError> {
         self.touch();
 
-        // Verify transaction exists
+        // Verify transaction exists (without holding the lock during the commit)
+        {
+            let transactions = self
+                .transactions
+                .lock()
+                .expect("transactions mutex poisoned");
+            if !transactions.contains_key(&transaction_id) {
+                // Check if it was aborted before treating as "not found"
+                return self.transaction_absent_error(transaction_id);
+            }
+        }
+
+        // Execute COMMIT on the connection
+        self.with_transaction_recovery(|| self.connection.execute_batch("COMMIT"))?;
+
         let mut transactions = self
             .transactions
             .lock()
             .expect("transactions mutex poisoned");
-        if !transactions.contains_key(&transaction_id) {
-            return Err(ServerError::TransactionNotFound);
-        }
-
-        // Execute COMMIT on the connection
-        self.connection.execute_batch("COMMIT")?;
-
         transactions.remove(&transaction_id);
+        let mut aborted = self
+            .aborted_transactions
+            .lock()
+            .expect("aborted_transactions mutex poisoned");
+        aborted.remove(&transaction_id);
         debug!("committed transaction");
         Ok(())
     }
@@ -682,19 +799,30 @@ impl Session {
     pub fn rollback_transaction(&self, transaction_id: TransactionId) -> Result<(), ServerError> {
         self.touch();
 
-        // Verify transaction exists
+        // Verify transaction exists (without holding the lock during the rollback)
+        {
+            let transactions = self
+                .transactions
+                .lock()
+                .expect("transactions mutex poisoned");
+            if !transactions.contains_key(&transaction_id) {
+                return self.transaction_absent_error(transaction_id);
+            }
+        }
+
+        // Execute ROLLBACK on the connection
+        self.with_transaction_recovery(|| self.connection.execute_batch("ROLLBACK"))?;
+
         let mut transactions = self
             .transactions
             .lock()
             .expect("transactions mutex poisoned");
-        if !transactions.contains_key(&transaction_id) {
-            return Err(ServerError::TransactionNotFound);
-        }
-
-        // Execute ROLLBACK on the connection
-        self.connection.execute_batch("ROLLBACK")?;
-
         transactions.remove(&transaction_id);
+        let mut aborted = self
+            .aborted_transactions
+            .lock()
+            .expect("aborted_transactions mutex poisoned");
+        aborted.remove(&transaction_id);
         debug!("rolled back transaction");
         Ok(())
     }
