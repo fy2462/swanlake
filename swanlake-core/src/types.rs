@@ -12,15 +12,25 @@ use arrow_array::{
     TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array,
     UInt8Array,
 };
-use arrow_schema::{DataType, IntervalUnit, TimeUnit};
+use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit};
 use duckdb::types::{TimeUnit as DuckTimeUnit, Value};
 use std::any::type_name;
+use std::sync::Arc;
 
 use crate::error::ServerError;
 
 /// Convert a DuckDB type string to an Arrow DataType.
 pub fn duckdb_type_to_arrow(duckdb_type: &str) -> Result<DataType, ServerError> {
     let upper = duckdb_type.trim().to_uppercase();
+
+    // Handle array types (e.g., VARCHAR[], BIGINT[], INTEGER[])
+    if let Some(element_type) = parse_array_type(&upper) {
+        let inner_type = duckdb_type_to_arrow(element_type)?;
+        return Ok(DataType::List(Arc::new(Field::new(
+            "item", inner_type, true,
+        ))));
+    }
+
     match upper.as_str() {
         // Signed integers
         "BIGINT" | "INT8" | "LONG" => Ok(DataType::Int64),
@@ -81,6 +91,14 @@ pub fn duckdb_type_to_arrow(duckdb_type: &str) -> Result<DataType, ServerError> 
             duckdb_type
         ))),
     }
+}
+
+/// Parse array type and return the element type if it's an array.
+/// Handles formats like "VARCHAR[]", "BIGINT[]", "INTEGER[][]" (multi-dimensional).
+fn parse_array_type(type_str: &str) -> Option<&str> {
+    let trimmed = type_str.trim();
+    // Remove one level of [] to get the element type
+    trimmed.strip_suffix("[]")
 }
 
 /// Parse precision and scale from a DECIMAL or NUMERIC type string.
@@ -380,6 +398,41 @@ mod tests {
         assert_eq!(
             duckdb_type_to_arrow("NUMERIC(60,5)").unwrap(),
             DataType::Decimal256(60, 5)
+        );
+    }
+
+    #[test]
+    fn duckdb_array_type_mappings() {
+        // Simple array types
+        assert_eq!(
+            duckdb_type_to_arrow("VARCHAR[]").unwrap(),
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+        );
+        assert_eq!(
+            duckdb_type_to_arrow("BIGINT[]").unwrap(),
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+        );
+        assert_eq!(
+            duckdb_type_to_arrow("INTEGER[]").unwrap(),
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+        );
+        assert_eq!(
+            duckdb_type_to_arrow("DOUBLE[]").unwrap(),
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true)))
+        );
+        assert_eq!(
+            duckdb_type_to_arrow("BOOLEAN[]").unwrap(),
+            DataType::List(Arc::new(Field::new("item", DataType::Boolean, true)))
+        );
+
+        // Multi-dimensional arrays (nested lists)
+        assert_eq!(
+            duckdb_type_to_arrow("INTEGER[][]").unwrap(),
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true
+            )))
         );
     }
 }

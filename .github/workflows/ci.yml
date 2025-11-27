@@ -18,8 +18,6 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.head_ref }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -103,6 +101,7 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
       packages: write
@@ -133,7 +132,6 @@ jobs:
         run: docker run --rm ghcr.io/${{ github.repository }}:${{ github.sha }} sh -c 'swanlake & sleep 5 && grpc-health-probe -addr=localhost:4214'
 
       - name: Tag and push latest
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           docker tag ghcr.io/${{ github.repository }}:${{ github.sha }} ghcr.io/${{ github.repository }}:latest
           docker push ghcr.io/${{ github.repository }}:latest
