@@ -1,3 +1,12 @@
+/// SQL rewrite utilities for SwanLake.  
+///  
+/// SwanLake does not support row-level locking clauses in SELECT statements  
+/// (e.g., FOR UPDATE, FOR SHARE) due to DuckDB compatibility. This module  
+/// provides utilities to strip these clauses from incoming SQL queries.  
+///  
+/// Note: Only locking clauses supported by sqlparser's GenericDialect are  
+/// stripped. PostgreSQL-specific variants like FOR NO KEY UPDATE or  
+/// FOR UPDATE OF may not be recognized.
 use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -58,6 +67,8 @@ pub fn strip_select_locks(sql: &str) -> SqlRewriteResult {
 
 #[cfg(test)]
 mod tests {
+    use std::result;
+
     use super::*;
 
     #[test]
@@ -82,5 +93,20 @@ mod tests {
         let result = strip_select_locks(input);
         assert!(result.stripped_select_locks);
         assert_eq!(result.sql, "USE swanlake; SELECT * FROM usertable");
+    }
+    #[test]
+    fn strip_select_locks_removes_for_share() {
+        let input = "SELECT * FROM usertable WHERE ycsb_key = ? FOR SHARE";
+        let result = strip_select_locks(input);
+        assert!(result.stripped_select_locks);
+        assert!(!result.sql.to_uppercase().contains("FOR SHARE"));
+    }
+
+    #[test]
+    fn strip_select_locks_removes_for_no_key_update() {
+        let input = "SELECT * FROM usertable FOR UPDATE SKIP LOCKED";
+        let result = strip_select_locks(input);
+        assert!(result.stripped_select_locks);
+        assert!(!result.sql.to_uppercase().contains("FOR UPDATE"));
     }
 }
